@@ -1,0 +1,13 @@
+langchain
+langchain-groq
+python-dotenv
+geopandas
+rasterio
+osmnx
+requests
+shapely
+pystac-client
+stackstac
+rioxarray
+scipy
+numpy
