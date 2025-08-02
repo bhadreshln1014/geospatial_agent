@@ -19,9 +19,10 @@ requests
 pystac-client
 stackstac
 rioxarray
+pyproj
 
 # Web Server & Visualization
 fastapi
 uvicorn
 python-multipart
-geoserver-rest
+geoserver-restconfig

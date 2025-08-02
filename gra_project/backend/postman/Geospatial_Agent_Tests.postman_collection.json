@@ -1,0 +1,610 @@
+{
+  "info": {
+    "name": "Geospatial Reasoning Agent API",
+    "description": "Test collection for the Geospatial Reasoning Agent with live data sources",
+    "version": "1.0.0",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8000",
+      "type": "string"
+    },
+    {
+      "key": "agent_endpoint",
+      "value": "{{base_url}}/agent_app/stream_query_agent/",
+      "type": "string"
+    },
+    {
+      "key": "files_endpoint",
+      "value": "{{base_url}}/agent_app/get_output_files/",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Simple Data Acquisition - Schools",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "exec": [
+              "// Set timestamp for tracking",
+              "pm.globals.set('test_timestamp', new Date().toISOString());"
+            ],
+            "type": "text/javascript"
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "// Test basic response",
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "pm.test('Content-Type is text/event-stream', function () {",
+              "    pm.expect(pm.response.headers.get('Content-Type')).to.include('text/event-stream');",
+              "});",
+              "",
+              "// Parse SSE events",
+              "const responseText = pm.response.text();",
+              "const events = responseText.split('\\n\\n').filter(line => line.startsWith('data: '));",
+              "",
+              "pm.test('Received streaming events', function () {",
+              "    pm.expect(events.length).to.be.greaterThan(0);",
+              "});",
+              "",
+              "// Check that only simple data acquisition was used (no buffer or MCA)",
+              "let hasUnnecessaryAnalysis = false;",
+              "events.forEach(event => {",
+              "    try {",
+              "        const data = JSON.parse(event.replace('data: ', ''));",
+              "        if (data.message && typeof data.message === 'string') {",
+              "            if (data.message.includes('PerformBufferAnalysis') || data.message.includes('PerformMultiCriteriaAnalysis')) {",
+              "                hasUnnecessaryAnalysis = true;",
+              "            }",
+              "        }",
+              "    } catch (e) {",
+              "        // Skip malformed events",
+              "    }",
+              "});",
+              "",
+              "pm.test('No unnecessary analysis performed for simple query', function () {",
+              "    pm.expect(hasUnnecessaryAnalysis).to.be.false;",
+              "});",
+              "",
+              "// Check for completion event",
+              "let completionEvent = null;",
+              "events.forEach(event => {",
+              "    try {",
+              "        const data = JSON.parse(event.replace('data: ', ''));",
+              "        if (data.type === 'complete') {",
+              "            completionEvent = data;",
+              "        }",
+              "    } catch (e) {",
+              "        // Skip malformed events",
+              "    }",
+              "});",
+              "",
+              "pm.test('Analysis completed successfully', function () {",
+              "    pm.expect(completionEvent).to.not.be.null;",
+              "    pm.expect(completionEvent.message).to.include('complete');",
+              "});",
+              "",
+              "if (completionEvent) {",
+              "    pm.test('Final map result is present', function () {",
+              "        pm.expect(completionEvent.final_map_result).to.exist;",
+              "    });",
+              "    ",
+              "    pm.test('Vector file type detected', function () {",
+              "        const mapResult = JSON.parse(completionEvent.final_map_result);",
+              "        pm.expect(mapResult.file_type).to.equal('vector');",
+              "    });",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Accept",
+            "value": "text/event-stream"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"find all schools in Chennai\"\n}"
+        },
+        "url": {
+          "raw": "{{agent_endpoint}}",
+          "host": ["{{agent_endpoint}}"]
+        },
+        "description": "Test simple data acquisition without unnecessary analysis"
+      }
+    },
+    {
+      "name": "Simple Suitability Analysis",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "exec": [
+              "// Set timestamp for tracking",
+              "pm.globals.set('test_timestamp', new Date().toISOString());"
+            ],
+            "type": "text/javascript"
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "// Test basic response",
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "pm.test('Content-Type is text/event-stream', function () {",
+              "    pm.expect(pm.response.headers.get('Content-Type')).to.include('text/event-stream');",
+              "});",
+              "",
+              "// Parse SSE events",
+              "const responseText = pm.response.text();",
+              "const events = responseText.split('\\n\\n').filter(line => line.startsWith('data: '));",
+              "",
+              "pm.test('Received streaming events', function () {",
+              "    pm.expect(events.length).to.be.greaterThan(0);",
+              "});",
+              "",
+              "// Check for completion event",
+              "let completionEvent = null;",
+              "events.forEach(event => {",
+              "    try {",
+              "        const data = JSON.parse(event.replace('data: ', ''));",
+              "        if (data.type === 'complete') {",
+              "            completionEvent = data;",
+              "        }",
+              "    } catch (e) {",
+              "        // Skip malformed events",
+              "    }",
+              "});",
+              "",
+              "pm.test('Analysis completed successfully', function () {",
+              "    pm.expect(completionEvent).to.not.be.null;",
+              "    pm.expect(completionEvent.message).to.include('complete');",
+              "});",
+              "",
+              "if (completionEvent) {",
+              "    pm.test('Final map result is present', function () {",
+              "        pm.expect(completionEvent.final_map_result).to.exist;",
+              "    });",
+              "    ",
+              "    pm.test('Workflow log is present', function () {",
+              "        pm.expect(completionEvent.workflow_log).to.be.an('array');",
+              "    });",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Accept",
+            "value": "text/event-stream"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"Find suitable areas for affordable housing in Palo Alto considering proximity to schools and avoiding noisy areas like bars\"\n}"
+        },
+        "url": {
+          "raw": "{{agent_endpoint}}",
+          "host": ["{{agent_endpoint}}"]
+        },
+        "description": "Test basic suitability analysis with multiple criteria"
+      }
+    },
+    {
+      "name": "Weather Analysis Query",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "// Check for temperature data acquisition",
+              "const responseText = pm.response.text();",
+              "pm.test('Temperature data mentioned in response', function () {",
+              "    pm.expect(responseText.toLowerCase()).to.include('temperature');",
+              "});",
+              "",
+              "// Parse events to check for tool usage",
+              "const events = responseText.split('\\n\\n').filter(line => line.startsWith('data: '));",
+              "let hasWeatherTool = false;",
+              "",
+              "events.forEach(event => {",
+              "    try {",
+              "        const data = JSON.parse(event.replace('data: ', ''));",
+              "        if (data.message && typeof data.message === 'string') {",
+              "            if (data.message.includes('AcquireGenericRasterData') || data.message.includes('temperature')) {",
+              "                hasWeatherTool = true;",
+              "            }",
+              "        }",
+              "    } catch (e) {",
+              "        // Skip malformed events",
+              "    }",
+              "});",
+              "",
+              "pm.test('Weather data tool was used', function () {",
+              "    pm.expect(hasWeatherTool).to.be.true;",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Accept",
+            "value": "text/event-stream"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"Analyze temperature patterns in Chennai for urban heat island assessment\"\n}"
+        },
+        "url": {
+          "raw": "{{agent_endpoint}}",
+          "host": ["{{agent_endpoint}}"]
+        },
+        "description": "Test weather data acquisition using Open-Meteo API"
+      }
+    },
+    {
+      "name": "Elevation Analysis Query",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "// Check for elevation data acquisition",
+              "const responseText = pm.response.text();",
+              "pm.test('Elevation data mentioned in response', function () {",
+              "    pm.expect(responseText.toLowerCase()).to.include('elevation');",
+              "});",
+              "",
+              "// Check for DEM tool usage",
+              "pm.test('DEM tool mentioned in response', function () {",
+              "    pm.expect(responseText).to.include('AcquireElevationData');",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Accept",
+            "value": "text/event-stream"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"Find flat areas suitable for agricultural development in Davis using elevation data\"\n}"
+        },
+        "url": {
+          "raw": "{{agent_endpoint}}",
+          "host": ["{{agent_endpoint}}"]
+        },
+        "description": "Test elevation data acquisition using Copernicus DEM"
+      }
+    },
+    {
+      "name": "Bhuvan Data Query (India)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "// Note: This might fail if Bhuvan service is down",
+              "const responseText = pm.response.text();",
+              "pm.test('Response contains data (service might be unavailable)', function () {",
+              "    pm.expect(responseText.length).to.be.greaterThan(100);",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Accept",
+            "value": "text/event-stream"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"Analyze land use patterns in Delhi using Bhuvan LULC data for urban planning\"\n}"
+        },
+        "url": {
+          "raw": "{{agent_endpoint}}",
+          "host": ["{{agent_endpoint}}"]
+        },
+        "description": "Test ISRO Bhuvan data acquisition (India-specific)"
+      }
+    },
+    {
+      "name": "Complex Multi-Source Analysis",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "// Parse SSE events",
+              "const responseText = pm.response.text();",
+              "const events = responseText.split('\\n\\n').filter(line => line.startsWith('data: '));",
+              "",
+              "// Count tool executions",
+              "let toolCount = 0;",
+              "let hasMCA = false;",
+              "let hasPublishMap = false;",
+              "",
+              "events.forEach(event => {",
+              "    try {",
+              "        const data = JSON.parse(event.replace('data: ', ''));",
+              "        if (data.type === 'tool_execution' || data.type === 'tool_start') {",
+              "            toolCount++;",
+              "        }",
+              "        if (data.message && typeof data.message === 'string') {",
+              "            if (data.message.includes('PerformMultiCriteriaAnalysis')) {",
+              "                hasMCA = true;",
+              "            }",
+              "            if (data.message.includes('PublishFinalMap')) {",
+              "                hasPublishMap = true;",
+              "            }",
+              "        }",
+              "    } catch (e) {",
+              "        // Skip malformed events",
+              "    }",
+              "});",
+              "",
+              "pm.test('Multiple tools were executed', function () {",
+              "    pm.expect(toolCount).to.be.greaterThan(2);",
+              "});",
+              "",
+              "pm.test('Multi-criteria analysis was performed', function () {",
+              "    pm.expect(hasMCA).to.be.true;",
+              "});",
+              "",
+              "pm.test('Final map was published', function () {",
+              "    pm.expect(hasPublishMap).to.be.true;",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Accept",
+            "value": "text/event-stream"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"Create a comprehensive suitability map for new parks in San Francisco considering elevation (prefer flat areas), proximity to schools (positive), distance from industrial areas (negative), and current temperature patterns\"\n}"
+        },
+        "url": {
+          "raw": "{{agent_endpoint}}",
+          "host": ["{{agent_endpoint}}"]
+        },
+        "description": "Test complex analysis using multiple data sources and tools"
+      }
+    },
+    {
+      "name": "Get Output Files",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "pm.test('Response is valid JSON', function () {",
+              "    pm.response.to.be.json;",
+              "});",
+              "",
+              "const jsonData = pm.response.json();",
+              "",
+              "pm.test('Files array is present', function () {",
+              "    pm.expect(jsonData).to.have.property('files');",
+              "    pm.expect(jsonData.files).to.be.an('array');",
+              "});",
+              "",
+              "if (jsonData.files && jsonData.files.length > 0) {",
+              "    pm.test('Files have required properties', function () {",
+              "        const file = jsonData.files[0];",
+              "        pm.expect(file).to.have.property('name');",
+              "        pm.expect(file).to.have.property('size');",
+              "        pm.expect(file).to.have.property('type');",
+              "    });",
+              "    ",
+              "    console.log('Available files:', jsonData.files.map(f => f.name));",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{files_endpoint}}",
+          "host": ["{{files_endpoint}}"]
+        },
+        "description": "Get list of generated output files"
+      }
+    },
+    {
+      "name": "Error Handling Test",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Handles empty query gracefully', function () {",
+              "    if (pm.response.code === 400) {",
+              "        const jsonData = pm.response.json();",
+              "        pm.expect(jsonData).to.have.property('error');",
+              "    } else {",
+              "        pm.expect(pm.response.code).to.equal(200);",
+              "    }",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"\"\n}"
+        },
+        "url": {
+          "raw": "{{agent_endpoint}}",
+          "host": ["{{agent_endpoint}}"]
+        },
+        "description": "Test error handling with empty query"
+      }
+    },
+    {
+      "name": "Invalid JSON Test",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Handles invalid JSON gracefully', function () {",
+              "    pm.expect(pm.response.code).to.be.oneOf([400, 500]);",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "invalid json"
+        },
+        "url": {
+          "raw": "{{agent_endpoint}}",
+          "host": ["{{agent_endpoint}}"]
+        },
+        "description": "Test error handling with invalid JSON"
+      }
+    }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "exec": [
+          "// Global pre-request setup",
+          "console.log('Testing Geospatial Reasoning Agent at:', pm.variables.get('base_url'));"
+        ],
+        "type": "text/javascript"
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "exec": [
+          "// Global test cleanup",
+          "const testName = pm.info.requestName;",
+          "const status = pm.response.code;",
+          "console.log(`✅ ${testName}: HTTP ${status}`);"
+        ],
+        "type": "text/javascript"
+      }
+    }
+  ]
+}
