@@ -1,0 +1,27 @@
+# Django
+django
+djangorestframework
+django-cors-headers
+
+# LangChain & LLM
+langchain
+langchain-groq
+python-dotenv
+
+# Geospatial & Data
+geopandas
+rasterio
+osmnx
+shapely
+scipy
+numpy
+requests
+pystac-client
+stackstac
+rioxarray
+
+# Web Server & Visualization
+fastapi
+uvicorn
+python-multipart
+geoserver-rest
