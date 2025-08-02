@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from tools import (
     acquire_vector_data, 
     acquire_elevation_data, 
-    acquire_raster_data,
+    acquire_generic_raster_data,
     perform_buffer_analysis, 
     perform_mca
 )
@@ -31,7 +31,7 @@ def setup_agent():
         ),
         Tool(
             name="AcquireGenericRasterData",
-            func=acquire_raster_data,
+            func=acquire_generic_raster_data,
             description="""Use to get specific raster data like 'landcover' or 'population_density'. Provide place name, asset_type ('landcover' or 'population_density'), and a date_range ('YYYY-MM-DD/YYYY-MM-DD'). Returns a GeoTIFF filepath."""
         ),
         Tool(
@@ -51,19 +51,52 @@ def setup_agent():
         ),
     ]
 
-    # This prompt is the agent's "brain"
+    # This prompt is the agent's "brain" - Version 2 with two-step reasoning
     prompt_template = ChatPromptTemplate.from_messages([
-        ("system", """You are a world-class Geospatial Reasoning Agent. Your task is to solve user queries by creating analytical maps.
+        ("system", """You are a world-class Geospatial Reasoning Agent. Your task is to solve user queries by first creating a structured workflow plan and then explaining how you would execute it.
 
-        **Your Process:**
-        1.  **Deconstruct & Plan:** Break down the user's request into a clear, step-by-step plan. Identify the geographic area, the goal (e.g., find suitable locations), and all criteria (e.g., near X, away from Y, on flat land).
-        2.  **Acquire All Data First:** Use the 'Acquire' tools to gather every single data layer needed for the analysis. Do not proceed to analysis until all data is acquired.
-        3.  **Perform Final Analysis with MCA:** Use the `PerformMultiCriteriaAnalysis` tool **once** at the very end. Provide a JSON string with:
-           - "files": list of ALL acquired filepaths
-           - "weights": list of weights (positive for favorable, negative for unfavorable)
-           - "output_name": simple name for the output map
-           Example: '{{"files": ["bars.geojson", "elevation.tif"], "weights": [-0.5, 0.3], "output_name": "school_suitability"}}'
-        4.  **Final Answer:** Your final answer must be ONLY the filepath of the map created by `PerformMultiCriteriaAnalysis`. Do not add any other text.
+        **Your Process is a strict two-step sequence:**
+
+        **STEP 1: FORMULATE THE PLAN**
+        First, based on the user's query, create a complete, step-by-step workflow plan.
+        This plan MUST be a valid JSON array of objects. Each object represents a single tool call and must have two keys:
+        1. "tool_name": The exact name of the tool to be called (e.g., "AcquireVectorData", "AcquireElevationData", "PerformMultiCriteriaAnalysis").
+        2. "parameters": A dictionary of all parameters required by that tool.
+        
+        For any step that requires a filepath from a previous step, use the placeholder '##PREVIOUS_STEP_X##' where X is the 1-based index of the step that generates the file.
+        
+        Example workflow plan format:
+        [
+          {{
+            "tool_name": "AcquireVectorData",
+            "parameters": {{
+              "query": "schools in Palo Alto"
+            }}
+          }},
+          {{
+            "tool_name": "AcquireVectorData", 
+            "parameters": {{
+              "query": "bars in Palo Alto"
+            }}
+          }},
+          {{
+            "tool_name": "AcquireElevationData",
+            "parameters": {{
+              "place_name": "Palo Alto"
+            }}
+          }},
+          {{
+            "tool_name": "PerformMultiCriteriaAnalysis",
+            "parameters": {{
+              "mca_config": "{{\\"files\\": [\\"##PREVIOUS_STEP_1##\\", \\"##PREVIOUS_STEP_2##\\", \\"##PREVIOUS_STEP_3##\\"], \\"weights\\": [0.2, -0.5, 0.3], \\"output_name\\": \\"school_suitability\\"}}"
+            }}
+          }}
+        ]
+
+        **STEP 2: EXPLANATION**
+        After providing the JSON plan, briefly explain what each step accomplishes and why the weights were chosen.
+
+        **CRITICAL:** Your response must start with valid JSON and end with a brief explanation. Do not include any other text before the JSON.
         """),
         ("human", "{input}"),
         ("placeholder", "{agent_scratchpad}"),

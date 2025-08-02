@@ -6,6 +6,7 @@ from rasterio.features import rasterize
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 import numpy as np
 import os
+import json
 from shapely.geometry import box
 import pystac_client
 import stackstac
@@ -135,52 +136,7 @@ def acquire_elevation_data(place_name: str) -> str:
     except Exception as e:
         return f"Error during elevation data acquisition: {e}"
 
-def acquire_raster_data(place_name: str, asset_type: str, date_range: str) -> str:
-    """
-    Acquires specific types of raster data like 'landcover' or 'population_density' for a place.
-    asset_type must be one of ['landcover', 'population_density'].
-    date_range should be like '2022-01-01/2022-12-31'.
-    """
-    print(f"TOOL: Acquiring '{asset_type}' raster for '{place_name}'")
-    try:
-        bounds, _ = get_bbox_from_place(place_name)
-        
-        if asset_type == 'landcover':
-            collection = "io-lulc-9-class"
-            asset = "data"
-            catalog_url = "https://earth-search.aws.element84.com/v1"
-        elif asset_type == 'population_density':
-            # Note: This is a common source but might require specific handling.
-            # For this example, we'll simulate a find. Let's use landcover as a stand-in.
-            print("INFO: 'population_density' is complex; using 'landcover' as a stand-in for demonstration.")
-            collection = "io-lulc-9-class" 
-            asset = "data"
-            catalog_url = "https://earth-search.aws.element84.com/v1"
-        else:
-            return f"Error: Unknown asset_type '{asset_type}'. Must be 'landcover' or 'population_density'."
 
-        catalog = pystac_client.Client.open(catalog_url)
-        search = catalog.search(
-            collections=[collection],
-            bbox=bounds,
-            datetime=date_range
-        )
-        items = list(search.get_items())
-        if not items:
-            return f"Error: No '{asset_type}' data found for the specified area and date range."
-
-        data_stack = stackstac.stack(items, assets=[asset], bounds_latlon=bounds, resolution=100).squeeze()
-
-        filepath = f"output/{place_name.replace(' ', '_')}_{asset_type}.tif"
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        data_stack.rio.to_raster(filepath, driver="GTiff")
-        print(f"TOOL: Saved {asset_type} data to {filepath}")
-        return filepath
-    except Exception as e:
-        return f"Error during raster data acquisition for {asset_type}: {e}"
-
-
-# --- Analysis Tools (FUN-006, FUN-007) ---
 
 def perform_buffer_analysis(vector_filepath: str, distance_meters: float) -> str:
     """
@@ -198,142 +154,170 @@ def perform_buffer_analysis(vector_filepath: str, distance_meters: float) -> str
     print(f"TOOL: Saved buffered data to {output_filepath}")
     return output_filepath
 
-def perform_mca(mca_config: str) -> str:
+def acquire_generic_raster_data(description: str) -> str:
     """
-    Performs a powerful Multi-Criteria Analysis. It handles rasters and vectors, reclassifies them, and calculates a weighted sum.
+    Acquire generic raster data (like temperature, precipitation, etc.).
+    Currently generates synthetic data for demonstration purposes.
     
-    'mca_config' is a JSON string containing the configuration, e.g.:
-    '{"files": ["file1.tif", "file2.geojson"], "weights": [0.5, -0.3], "output_name": "suitability_map"}'
-    
-    Returns the filepath of the final suitability raster.
+    Args:
+        description: Natural language description of the raster data needed
+        
+    Returns:
+        str: Path to the acquired raster file
     """
-    print("TOOL: Performing Multi-Criteria Analysis")
+    # Generate synthetic raster data based on description
+    # This is a placeholder - in production, this would connect to real data sources
     
-    # Parse the JSON configuration
-    import json
-    try:
-        config = json.loads(mca_config)
-        files = config['files']
-        weights = config['weights']
-        final_output_name = config['output_name']
-    except (json.JSONDecodeError, KeyError) as e:
-        return f"Error parsing MCA configuration: {e}"
+    width, height = 100, 100
     
-    if len(files) != len(weights):
-        return "Error: Number of files must match number of weights."
+    # Create synthetic data based on description keywords
+    if any(word in description.lower() for word in ['temperature', 'temp', 'heat']):
+        # Temperature-like data (15-35°C range)
+        data = np.random.uniform(15, 35, (height, width))
+        data_type = 'temperature'
+    elif any(word in description.lower() for word in ['precipitation', 'rainfall', 'rain']):
+        # Precipitation-like data (0-200mm range)
+        data = np.random.uniform(0, 200, (height, width))
+        data_type = 'precipitation'
+    elif any(word in description.lower() for word in ['population', 'density']):
+        # Population density-like data
+        data = np.random.uniform(0, 5000, (height, width))
+        data_type = 'population_density'
+    else:
+        # Generic normalized data (0-1 range)
+        data = np.random.uniform(0, 1, (height, width))
+        data_type = 'generic_raster'
     
-    processed_rasters = []
+    # Create output filename
+    clean_desc = "_".join(description.lower().split()[:3])  # First 3 words
+    output_path = f"output/{clean_desc}_{data_type}.tif"
+    
+    # Default geospatial metadata (would be location-specific in production)
+    transform = rasterio.transform.from_bounds(-122.5, 37.2, -122.0, 37.7, width, height)
+    
+    meta = {
+        'driver': 'GTiff',
+        'dtype': 'float32',
+        'width': width,
+        'height': height,
+        'count': 1,
+        'crs': 'EPSG:4326',
+        'transform': transform,
+        'nodata': None
+    }
+    
+    # Save the raster
+    with rasterio.open(output_path, 'w', **meta) as dst:
+        dst.write(data.astype('float32'), 1)
+    
+    print(f"✅ Generic raster data created: {output_path}")
+    return output_path
+
+
+def perform_mca(config_string: str) -> str:
+    """
+    Performs multi-criteria analysis (MCA) on geospatial layers.
+    
+    Args:
+        config_string: JSON configuration with 'files' (list of paths) and 'weights' (list of floats)
+        
+    Returns:
+        str: Path to the saved MCA raster file
+    """
+    config = json.loads(config_string)
+    layer_paths = config['files']  # Changed from 'layer_paths' to 'files'
+    weights = config['weights']
+    
+    # Validate inputs
+    if len(layer_paths) != len(weights) or len(layer_paths) == 0:
+        raise ValueError("Number of layers must match number of weights and be > 0")
+    
+    # Normalize weights to sum to 1
+    total_weight = sum(abs(w) for w in weights)  # Use absolute values to avoid zero sum
+    if total_weight == 0:
+        total_weight = 1  # Prevent division by zero
+    normalized_weights = [w / total_weight for w in weights]
+    
+    weighted_arrays = []
     base_meta = None
     
-    # Use the first raster layer to define the analysis grid
-    for file_path in files:
-        if file_path.endswith('.tif'):
-            try:
-                with rasterio.open(file_path) as src:
-                    base_meta = src.meta.copy()
-                    break
-            except Exception as e:
-                print(f"  - WARNING: Could not read raster {file_path}: {e}")
-                continue
+    # First, find a raster file to get the reference metadata
+    raster_file = None
+    for path in layer_paths:
+        if path.endswith('.tif') or path.endswith('.tiff'):
+            raster_file = path
+            break
     
-    # If no raster found, create a basic grid based on the vector data bounds
-    if not base_meta:
-        print("  - No raster found, creating base grid from vector bounds")
-        # Get bounds from the first vector file
-        for file_path in files:
-            if file_path.endswith('.geojson'):
-                try:
-                    gdf = gpd.read_file(file_path)
-                    if not gdf.empty:
-                        bounds = gdf.total_bounds
-                        # Create a basic raster metadata
-                        from rasterio.transform import from_bounds
-                        height, width = 100, 100
-                        transform = from_bounds(bounds[0], bounds[1], bounds[2], bounds[3], width, height)
-                        base_meta = {
-                            'driver': 'GTiff',
-                            'height': height,
-                            'width': width,
-                            'count': 1,
-                            'dtype': 'float32',
-                            'crs': gdf.crs,
-                            'transform': transform,
-                            'shape': (height, width)
-                        }
-                        break
-                except Exception as e:
-                    print(f"  - WARNING: Could not read vector {file_path}: {e}")
-                    continue
+    if raster_file:
+        with rasterio.open(raster_file) as src:
+            base_meta = src.meta.copy()
+    else:
+        # Create default metadata if no raster found
+        base_meta = {
+            'driver': 'GTiff',
+            'dtype': 'float32',
+            'width': 1000,
+            'height': 1000,
+            'count': 1,
+            'crs': 'EPSG:4326',
+            'transform': rasterio.transform.from_bounds(-122.2, 37.4, -122.0, 37.6, 1000, 1000),
+            'nodata': None
+        }
         
-        if not base_meta:
-            return "Error: Could not establish analysis grid from any input files."
-    
-    # Process each layer
-    for i, file_path in enumerate(files):
-        weight = weights[i]
-        print(f"  - Processing {file_path} with weight {weight}")
+    for i, (layer_path, weight) in enumerate(zip(layer_paths, normalized_weights)):
+        print(f"Processing layer {i+1}: {layer_path} (weight: {weight:.3f})")
         
-        # A. Process Raster Layers
-        if file_path.endswith('.tif'):
-            with rasterio.open(file_path) as src:
-                aligned_data = np.zeros((base_meta['height'], base_meta['width']), dtype=np.float32)
-                reproject(
-                    source=rasterio.band(src, 1), destination=aligned_data,
-                    src_transform=src.transform, src_crs=src.crs,
-                    dst_transform=base_meta['transform'], dst_crs=base_meta['crs'],
-                    resampling=Resampling.bilinear)
-                
-                data = aligned_data
-        
-        # B. Process Vector Layers (convert to proximity raster)
-        elif file_path.endswith('.geojson'):
-            gdf = gpd.read_file(file_path).to_crs(base_meta['crs'])
-            if gdf.empty: continue
+        if layer_path.endswith('.geojson'):
+            # Convert vector to raster
+            print(f"  Converting vector to raster...")
+            gdf = gpd.read_file(layer_path)
             
-            # Rasterize the vector shapes to create a binary mask
-            mask = rasterize(
-                shapes=[geom for geom in gdf.geometry],
-                out_shape=(base_meta['height'], base_meta['width']),
-                transform=base_meta['transform'],
-                fill=0,
-                all_touched=True,
-                dtype=np.uint8
-            )
-            
-            # Calculate distance from the features
-            # distance_transform_edt returns distance to nearest non-zero pixel
-            data = distance_transform_edt(mask == 0) 
-            
-            # For negative weights (unfavorable), use distance as-is (farther = better)
-            # For positive weights (favorable), invert distance (closer = better)
-            if weight > 0:
-                data = data.max() - data if data.max() > 0 else data
-
+            if len(gdf) == 0:
+                # Empty dataset - create zero array
+                layer_data = np.zeros((base_meta['height'], base_meta['width']), dtype=float)
+            else:
+                # Rasterize the vector data
+                shapes = [(geom, 1) for geom in gdf.geometry]
+                layer_data = rasterize(
+                    shapes,
+                    out_shape=(base_meta['height'], base_meta['width']),
+                    transform=base_meta['transform'],
+                    fill=0,
+                    dtype='float32'
+                ).astype(float)
         else:
-            print(f"  - WARNING: Skipping unsupported file type: {file_path}")
-            continue
-
-        # C. Normalize to 0-1 and apply weight
-        min_val, max_val = data.min(), data.max()
+            # Read raster data
+            with rasterio.open(layer_path) as src:
+                layer_data = src.read(1).astype(float)
+            
+        # Normalize to 0-1 range (handle edge cases)
+        min_val, max_val = layer_data.min(), layer_data.max()
         if max_val > min_val:
-            normalized_data = (data - min_val) / (max_val - min_val)
+            normalized_data = (layer_data - min_val) / (max_val - min_val)
         else:
-            normalized_data = np.zeros_like(data)
-            
-        processed_rasters.append(normalized_data * weight)
-
-    # D. Sum the weighted layers
-    if not processed_rasters: return "Error: No layers were successfully processed for MCA."
-    
-    final_suitability = np.sum(processed_rasters, axis=0)
-    
-    # E. Save the final result
-    output_filepath = f"output/{final_output_name}.tif"
-    base_meta.update({"dtype": "float32", "nodata": -9999})
-    final_suitability[final_suitability==0] = -9999 # Set no-data value
-    
-    with rasterio.open(output_filepath, 'w', **base_meta) as dst:
-        dst.write(final_suitability.astype(np.float32), 1)
+            # If all values are the same, set to 0.5 (neutral)
+            normalized_data = np.full_like(layer_data, 0.5)
         
-    print(f"TOOL: Saved final MCA map to {output_filepath}")
-    return output_filepath
+        # Apply weight
+        weighted_layer = normalized_data * weight
+        weighted_arrays.append(weighted_layer)
+    
+    # Sum all weighted layers
+    mca_result = np.sum(weighted_arrays, axis=0)
+    
+    # Determine output path
+    base_filename = "_".join(config.get('output_name', 'mca_result').split())
+    output_path = f"output/{base_filename}.tif"
+    
+    # Update metadata for output
+    base_meta.update({
+        'dtype': 'float32',
+        'nodata': None
+    })
+    
+    # Save MCA result
+    with rasterio.open(output_path, 'w', **base_meta) as dst:
+        dst.write(mca_result.astype('float32'), 1)
+    
+    print(f"✅ MCA complete! Saved to: {output_path}")
+    return output_path
