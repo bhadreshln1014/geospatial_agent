@@ -1,133 +1,149 @@
+import os
 from langchain_groq import ChatGroq
-from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate
-from langchain.tools import tool
-from dotenv import load_dotenv
+from langchain_core.output_parsers import PydanticOutputParser
+from pydantic import BaseModel, Field
+from typing import List, Dict, Any, Optional
+from . import tools as gis_tools
+import inspect
 
-# Import our custom GIS tools
-from .tools import (
-    acquire_vector_data, 
-    acquire_elevation_data, 
-    acquire_generic_raster_data,
-    acquire_bhuvan_data,
-    perform_buffer_analysis, 
-    perform_mca,
-    publish_final_map,
-    acquire_raster_wrapper,
-    buffer_analysis_wrapper
-)
+# --- Pydantic Models for Structured Output ---
+class ReclassificationRule(BaseModel):
+    from_val: float
+    to_val: float
+    output_val: float
+    label: str = Field(description="A human-readable label for this range, e.g., 'Ideal Slope'")
 
-@tool
-def acquire_vector_data_tool(query: str) -> str:
-    """Use to get vector features like points, lines, or polygons from OpenStreetMap. Provide a query describing what you want and where, e.g., 'restaurants in Palo Alto', 'parks in Davis', 'buildings in downtown', 'bars in the city center'. Returns a GeoJSON filepath."""
-    return acquire_vector_data(query)
+class ParameterDetail(BaseModel):
+    name: str
+    value: Any
+    reasoning: str = Field(description="Detailed explanation of why this parameter value was chosen.")
+    reclassification: Optional[List[ReclassificationRule]] = Field(None, description="The reclassification rules for this parameter, if applicable.")
+    weight: Optional[float] = Field(None, description="The weight assigned to this parameter in an MCA.")
 
-@tool
-def acquire_elevation_data_tool(place_name: str) -> str:
-    """Use to get a Digital Elevation Model (DEM) raster for a place using live Copernicus DEM data. Essential for analyzing slope and finding flat or steep areas. REQUIRES ONE PARAMETER: place_name (Name of the location to get elevation data for, e.g., 'Chennai'). Returns a GeoTIFF filepath."""
-    return acquire_elevation_data(place_name)
+class ToolCall(BaseModel):
+    step: int
+    tool_name: str
+    reasoning: str = Field(description="Detailed explanation of why this specific tool was chosen for this step.")
+    parameters: List[ParameterDetail]
 
-@tool
-def acquire_generic_raster_data_tool(args_string: str) -> str:
-    """Use to get weather raster data using Open-Meteo API. REQUIRES: Single string argument in format 'place_name,raster_type' - place_name: Location name (e.g., 'Chennai'), raster_type: Either 'temperature' or 'precipitation'. Example usage: Call with "Chennai,temperature" or "Chennai,precipitation". Returns a GeoTIFF filepath."""
-    return acquire_raster_wrapper(args_string)
+class WorkflowPlan(BaseModel):
+    success: bool = Field(description="Was the planning successful?")
+    plan: Optional[List[ToolCall]] = Field(None, description="The sequence of tool calls to execute. This is null if planning failed.")
+    overall_reasoning: str = Field(description="A high-level summary of the workflow strategy, OR the reason for failure.")
 
-@tool
-def acquire_bhuvan_data_tool(place_name: str, layer_name: str) -> str:
-    """Use to get vector data from ISRO's Bhuvan platform. Provide place_name and layer_name (e.g., 'LULC_1011_250K:lu250k_1011_b'). Returns a GeoJSON filepath."""
-    return acquire_bhuvan_data(place_name, layer_name)
-
-@tool
-def perform_buffer_analysis_tool(args_string: str) -> str:
-    """Use to create a buffer zone around vector features for proximity analysis. REQUIRES: Single string argument in format 'vector_filepath,distance_meters' - vector_filepath: Path to the GeoJSON file, distance_meters: Buffer distance in meters (e.g., 1000 for 1km buffer). Example usage: Call with "/path/to/file.geojson,500". Returns a new GeoJSON filepath with buffered features."""
-    return buffer_analysis_wrapper(args_string)
-
-@tool
-def perform_multi_criteria_analysis_tool(config_json: str) -> str:
-    """Use to combine all previously acquired data layers into a single suitability map. Provide a JSON string with the configuration, e.g.: '{"files": ["path1.geojson", "path2.tif"], "weights": [-0.5, 0.3], "output_name": "school_suitability"}'. Weights: positive = favorable, negative = unfavorable. Returns the final raster filepath."""
-    return perform_mca(config_json)
-
-@tool
-def publish_final_map_tool(raster_filepath: str) -> str:
-    """FINAL STEP: Publishes the completed suitability/analysis raster to GeoServer and returns WMS connection details. Provide the absolute filepath of the final raster. Returns JSON with wmsUrl, layerName, and bbox."""
-    return publish_final_map(raster_filepath)
-
-def setup_agent():
-    """Sets up the LangChain agent with all the GIS tools."""
-    load_dotenv()
-
-    # Define the tools list
-    tools = [
-        acquire_vector_data_tool,
-        acquire_elevation_data_tool, 
-        acquire_generic_raster_data_tool,
-        acquire_bhuvan_data_tool,
-        perform_buffer_analysis_tool,
-        perform_multi_criteria_analysis_tool,
-        publish_final_map_tool,
+def get_tool_signatures() -> str:
+    """
+    A helper function to generate a plain text description of available tools
+    and their function signatures for the LLM prompt.
+    """
+    tool_functions = [
+        gis_tools.acquire_osm_data,
+        gis_tools.acquire_dem_data,
+        gis_tools.acquire_bhuvan_data,
+        gis_tools.filter_vector_by_attribute,
+        gis_tools.perform_buffer,
+        gis_tools.calculate_slope,
+        gis_tools.reclassify_raster,
+        gis_tools.calculate_proximity_raster,
+        gis_tools.perform_weighted_overlay,
+        gis_tools.publish_to_geoserver
     ]
+    
+    signatures = []
+    for func in tool_functions:
+        try:
+            # Get the function signature and the first line of the docstring
+            docstring = func.__doc__
+            if docstring:
+                docstring = docstring.strip().split('\n')[0]
+            else:
+                docstring = "No description available"
+            signatures.append(f"- `{func.__name__}`: {docstring}")
+        except Exception as e:
+            signatures.append(f"- `{func.__name__}`: Error getting signature - {e}")
+        
+    return "\n".join(signatures)
 
-    # This prompt is the agent's "brain" - Updated to include PublishFinalMap
-    prompt_template = ChatPromptTemplate.from_messages([
-        ("system", """You are a world-class Geospatial Reasoning Agent. Your task is to solve user queries by acquiring and analyzing geospatial data, then publishing the results to a web map service.
+# --- NEW: Function to Generate a Strict Tool Schema ---
+def get_tool_schemas_as_text() -> str:
+    """
+    Introspects the tools.py module to generate a precise, machine-readable
+    description of all available tools, including their exact parameter names and types.
+    This becomes the "single source of truth" for the Planner Agent.
+    """
+    tool_functions = [
+        gis_tools.acquire_osm_data,
+        gis_tools.acquire_dem_data,
+        gis_tools.acquire_bhuvan_data,
+        gis_tools.filter_vector_by_attribute,
+        gis_tools.perform_buffer,
+        gis_tools.calculate_slope,
+        gis_tools.reclassify_raster,
+        gis_tools.calculate_proximity_raster,
+        gis_tools.perform_weighted_overlay,
+        gis_tools.publish_to_geoserver
+    ]
+    
+    schemas = []
+    for func in tool_functions:
+        try:
+            sig = inspect.signature(func)
+            docstring = func.__doc__.strip().split('\n')[0] if func.__doc__ else "No description available."
+            
+            params = []
+            for name, param in sig.parameters.items():
+                param_type = param.annotation if param.annotation != inspect.Parameter.empty else 'Any'
+                params.append(f"{name}: {param_type}")
+            
+            param_str = ", ".join(params)
+            schema = f"- Tool: `{func.__name__}({param_str})`\n  Description: {docstring}"
+            schemas.append(schema)
+        except Exception as e:
+            schemas.append(f"- Tool: `{func.__name__}`: Error generating schema - {e}")
+        
+    return "\n".join(schemas)
 
-        **IMPORTANT: Analyze the user's intent carefully:**
-        - If they ask to "find" or "locate" features (e.g., "find schools in Chennai"), simply acquire the data and publish it
-        - Only perform additional analysis (buffers, MCA) if explicitly requested or needed for suitability/risk analysis
+def setup_planner_agent():
+    """Sets up the LLM agent to ONLY generate a JSON workflow plan."""
+    
+    # Generate the plain text list of available tools
+    tool_list_str = get_tool_schemas_as_text()
+    
+    # Create the parser first
+    parser = PydanticOutputParser(pydantic_object=WorkflowPlan)
+    
+    # Get format instructions and escape template variables
+    format_instructions = parser.get_format_instructions()
+    # Escape any curly braces in the format instructions to prevent template conflicts
+    format_instructions = format_instructions.replace('{', '{{').replace('}', '}}')
+    
+    # Create the system prompt with format instructions already included
+    system_prompt = f"""You are an Expert Geospatial Workflow Planner. Your SOLE purpose is to convert a user's query into a structured JSON object conforming to the 'WorkflowPlan' schema. You DO NOT execute tools; you only create the plan.
 
-        **Your Process:**
+**Your Process:**
+1. **Analyze and Deconstruct:** Deeply understand the user's goal, all criteria (including numerical ranges), and the location.
+2. **Check Capabilities:** Compare the required steps against your list of available tools below.
+3. **Formulate the Output:**
+   - **If you can solve the query:** Set `success` to `true`. Formulate a step-by-step `plan`, providing detailed reasoning for every tool choice, parameter, weight, and reclassification. Use `##step_N_output##` placeholders to link steps.
+   - **If you CANNOT solve the query:** Set `success` to `false`. Set `plan` to `null`. Your `overall_reasoning` MUST clearly explain why the query cannot be solved (e.g., "I do not have a tool for network routing.").
 
-        **STEP 1: DATA ACQUISITION (Sequential - Execute ONE tool at a time)**
-        Use the available tools to gather the necessary geospatial data:
-        - acquire_vector_data_tool: Get OpenStreetMap features
-        - acquire_elevation_data_tool: Get DEM data (requires place_name)
-        - acquire_generic_raster_data_tool: Get weather data (requires "place_name,raster_type" format)
-        - acquire_bhuvan_data_tool: Get vector data from Bhuvan
-        - perform_buffer_analysis_tool: Create proximity zones (requires "vector_filepath,distance_meters" format)
+**CRITICAL:** Do not try to make up tools. If a capability is missing from the list below, you must report the failure.
 
-        **STEP 2: ANALYSIS (if needed)**
-        - Use perform_multi_criteria_analysis_tool ONLY for suitability/risk analysis with multiple criteria
+**Available Tools:**
+{tool_list_str}
 
-        **STEP 3: PUBLICATION (MANDATORY FINAL STEP)**
-        - ALWAYS use publish_final_map_tool as your final action
-        - This tool publishes the map to GeoServer and returns WMS connection details
-
-        **CRITICAL REQUIREMENTS:**
-        1. Your final answer MUST be the JSON output from publish_final_map_tool
-        2. Do not provide any commentary after calling publish_final_map_tool
-        3. Always end with map publication - never skip this step
-        4. Use absolute file paths when calling tools that require file inputs
-        5. For simple "find X" queries, just acquire data and publish - no additional analysis needed
-        6. Execute tools SEQUENTIALLY, not in parallel
-        7. NEVER use placeholder paths - always use the actual file paths returned by previous tools
-        8. When calling tools with multiple parameters, use the correct format:
-           - acquire_generic_raster_data_tool: Use "place_name,raster_type" (e.g., "Chennai,temperature")
-           - perform_buffer_analysis_tool: Use "vector_filepath,distance_meters" (e.g., "/path/file.geojson,1000")
-
-        **Available Tools:**
-        - acquire_vector_data_tool: Get OSM vector features
-        - acquire_elevation_data_tool: Get DEM data using Copernicus
-        - acquire_generic_raster_data_tool: Get weather data (temperature/precipitation)
-        - acquire_bhuvan_data_tool: Get ISRO Bhuvan vector data
-        - perform_buffer_analysis_tool: Create buffer zones (requires vector_filepath AND distance_meters)
-        - perform_multi_criteria_analysis_tool: Combine layers into suitability map
-        - publish_final_map_tool: Publish to GeoServer (MANDATORY FINAL STEP)
-
-        **Examples:**
-        - "Find schools in Chennai" → acquire_vector_data_tool → publish_final_map_tool
-        - "Suitable areas for housing considering schools and elevation" → acquire_vector_data_tool + acquire_elevation_data_tool → perform_multi_criteria_analysis_tool → publish_final_map_tool
-
-        Remember: Your workflow must ALWAYS end by calling publish_final_map_tool and returning its JSON output as your final answer.
-        """),
-        ("human", "{input}"),
-        ("placeholder", "{agent_scratchpad}"),
+{format_instructions}"""
+    
+    # Create the LLM
+    llm = ChatGroq(model_name="deepseek-r1-distill-llama-70b", temperature=0)
+    
+    # Create the prompt template
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", "{input}")
     ])
-
-    # Initialize the LLM (using llama3-70b for better function calling compatibility)
-    llm = ChatGroq(model_name="llama3-70b-8192", temperature=0)
-
-    # Create the agent and agent executor
-    agent = create_tool_calling_agent(llm, tools, prompt_template)
-    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
-
-    return agent_executor
+    
+    # Create and return the chain
+    chain = prompt | llm | parser
+    return chain

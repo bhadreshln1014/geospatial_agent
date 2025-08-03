@@ -20,9 +20,13 @@ pystac-client
 stackstac
 rioxarray
 pyproj
+pysal
+whitebox
+scikit-learn
 
 # Web Server & Visualization
 fastapi
 uvicorn
 python-multipart
 geoserver-restconfig
+geoserver-rest

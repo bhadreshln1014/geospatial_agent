@@ -1,238 +1,124 @@
-from django.http import JsonResponse, StreamingHttpResponse
-from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_POST
+from django.http import StreamingHttpResponse, JsonResponse
+from django.conf import settings
+from rest_framework.views import APIView
+from rest_framework.response import Response
 import json
 import os
-import time
-from .agent import setup_agent # Import from the local app folder
-from .callbacks import WorkflowLoggingCallbackHandler
+import shutil
+from .agent import setup_planner_agent
+from .models import AnalysisThread, ThreadMessage
+from . import tools as gis_tools
 
-# --- Agent Initialization (Lazy Loading) ---
-GRA_AGENT = None
+# --- LAZY AGENT & TOOL SETUP ---
+_PLANNER_AGENT = None
 
-def get_agent():
-    """Initialize agent only when first needed (lazy loading)"""
-    global GRA_AGENT
-    if GRA_AGENT is None:
-        print("▶️ Initializing Geospatial Reasoning Agent...")
-        GRA_AGENT = setup_agent()
-        print("✅ GRA Agent initialized and ready.")
-    return GRA_AGENT
+def get_planner_agent():
+    """Lazy initialization of the planner agent."""
+    global _PLANNER_AGENT
+    if _PLANNER_AGENT is None:
+        _PLANNER_AGENT = setup_planner_agent()
+    return _PLANNER_AGENT
 
-@require_POST
-@csrf_exempt
-def stream_query_agent(request):
-    """
-    Handles a query and streams the agent's full execution process (CoT)
-    back to the client using Server-Sent Events (SSE).
-    """
-    try:
-        data = json.loads(request.body)
-        query = data.get('query')
-        if not query:
-            return JsonResponse({'error': 'Query not provided'}, status=400)
+TOOL_MAPPING = {
+    "acquire_osm_data": gis_tools.acquire_osm_data,
+    "acquire_dem_data": gis_tools.acquire_dem_data,
+    "acquire_bhuvan_data": gis_tools.acquire_bhuvan_data,
+    "filter_vector_by_attribute": gis_tools.filter_vector_by_attribute,
+    "perform_buffer": gis_tools.perform_buffer,
+    "calculate_slope": gis_tools.calculate_slope,
+    "reclassify_raster": gis_tools.reclassify_raster,
+    "calculate_proximity_raster": gis_tools.calculate_proximity_raster,
+    "perform_weighted_overlay": gis_tools.perform_weighted_overlay,
+    "publish_to_geoserver": gis_tools.publish_to_geoserver,
+}
 
-        print(f"▶️ Received STREAMING query: \"{query}\"")
+class PlannerView(APIView):
+    """Handles the planning stage: User Query -> AI-Generated Workflow Plan."""
+    def post(self, request, *args, **kwargs):
+        query = request.data.get('query')
+        thread_id = request.data.get('thread_id')
 
-        # The generator function that will yield events
-        def event_stream_generator():
-            # Get the agent (initializes on first use)
-            agent = get_agent()
-            
-            # Create the workflow logging callback handler
-            callback_handler = WorkflowLoggingCallbackHandler()
-            
-            # Send initial analysis start event
-            yield f"data: {json.dumps({'type': 'start', 'message': '🤖 Starting geospatial analysis...', 'query': query})}\n\n"
-            
-            # Send planning phase notification
-            yield f"data: {json.dumps({'type': 'phase', 'message': '📋 Analyzing requirements and acquiring data...', 'phase': 'planning'})}\n\n"
-            
-            # Use the .stream() method of the agent with callback handler
-            stream = agent.stream({"input": query}, config={'callbacks': [callback_handler]})
-            
-            step_count = 0
-            final_result = None
-            
-            for chunk in stream:
-                try:
-                    print(f"DEBUG: Chunk type: {type(chunk)}, Content: {chunk}")
-                    
-                    # Handle different types of chunks from LangChain
-                    if isinstance(chunk, dict):
-                        # Process dictionary chunks
-                        enhanced_chunk = {}
-                        
-                        # Safely extract serializable data from chunk
-                        for key, value in chunk.items():
-                            try:
-                                if hasattr(value, 'content'):  # AIMessage or similar
-                                    content = str(value.content)
-                                    enhanced_chunk[key] = content
-                                    # Check if this contains the final JSON result
-                                    if key == 'output' and 'wmsUrl' in content:
-                                        final_result = content
-                                elif hasattr(value, 'dict'):  # Pydantic models
-                                    enhanced_chunk[key] = value.dict()
-                                elif isinstance(value, (str, int, float, bool, type(None))):
-                                    enhanced_chunk[key] = value
-                                    # Check if this is the final JSON result
-                                    if isinstance(value, str) and 'wmsUrl' in value:
-                                        final_result = value
-                                elif isinstance(value, list):
-                                    # Handle lists (like actions, steps, messages)
-                                    enhanced_chunk[key] = f"[{len(value)} items]"
-                                else:
-                                    # Convert to string for non-serializable objects
-                                    enhanced_chunk[key] = str(value)
-                            except Exception as e:
-                                # Skip problematic values
-                                enhanced_chunk[key] = f"<{type(value).__name__}>"
-                                continue
-                        
-                        # Send reasoning or action messages only if we have useful content
-                        if enhanced_chunk and any(isinstance(v, str) and len(v) > 10 for v in enhanced_chunk.values()):
-                            enhanced_chunk['timestamp'] = time.time()
-                            
-                            # Detect tool execution from content
-                            content_str = str(enhanced_chunk)
-                            if any(tool in content_str for tool in ['AcquireVectorData', 'AcquireElevationData', 'AcquireGenericRasterData', 'AcquireBhuvanData', 'PerformBufferAnalysis', 'PerformMultiCriteriaAnalysis', 'PublishFinalMap']):
-                                step_count += 1
-                                yield f"data: {json.dumps({'type': 'tool_execution', 'message': f'🛠️ Step {step_count}: Executing geospatial operation...', 'step': step_count, 'timestamp': time.time()})}\n\n"
-                            
-                            yield f"data: {json.dumps({'type': 'thought', 'message': enhanced_chunk, 'timestamp': time.time()})}\n\n"
-                    
-                    else:
-                        # Handle non-dict chunks (like AIMessage objects)
-                        content = ""
-                        if hasattr(chunk, 'content'):
-                            content = chunk.content
-                        elif hasattr(chunk, 'text'):
-                            content = chunk.text
-                        else:
-                            content = str(chunk)
-                        
-                        if content and content.strip():  # Only send non-empty content
-                            # Check if this is the final JSON result
-                            if 'wmsUrl' in content:
-                                final_result = content
-                            
-                            # Check if this looks like a tool execution
-                            if any(tool in content for tool in ['AcquireVectorData', 'AcquireElevationData', 'AcquireGenericRasterData', 'AcquireBhuvanData', 'PerformBufferAnalysis', 'PerformMultiCriteriaAnalysis', 'PublishFinalMap']):
-                                step_count += 1
-                                yield f"data: {json.dumps({'type': 'tool_start', 'message': f'🛠️ Step {step_count}: Executing geospatial tool...', 'step': step_count, 'timestamp': time.time()})}\n\n"
-                            
-                            message_data = {
-                                'type': 'message',
-                                'message': content,
-                                'timestamp': time.time()
-                            }
-                            yield f"data: {json.dumps(message_data)}\n\n"
-                        
-                except Exception as e:
-                    print(f"Error processing chunk: {e}")
-                    # Send error message to frontend but continue processing
-                    error_data = {
-                        'type': 'error',
-                        'message': f'Stream processing issue (continuing...): {str(e)}',
-                        'timestamp': time.time()
-                    }
-                    yield f"data: {json.dumps(error_data)}\n\n"
-
-            # Get workflow summary from callback handler
-            workflow_summary = callback_handler.get_summary()
-            
-            # Clean workflow and reasoning logs for JSON serialization
-            clean_workflow_log = []
-            for entry in workflow_summary.get('workflow_log', []):
-                clean_entry = {}
-                for key, value in entry.items():
-                    try:
-                        # Test if value is JSON serializable
-                        json.dumps(value)
-                        clean_entry[key] = value
-                    except (TypeError, ValueError):
-                        # Convert non-serializable values to strings
-                        clean_entry[key] = str(value)
-                clean_workflow_log.append(clean_entry)
-            
-            clean_reasoning_log = []
-            for entry in workflow_summary.get('reasoning_log', []):
-                clean_entry = {}
-                for key, value in entry.items():
-                    try:
-                        # Test if value is JSON serializable
-                        json.dumps(value)
-                        clean_entry[key] = value
-                    except (TypeError, ValueError):
-                        # Convert non-serializable values to strings
-                        clean_entry[key] = str(value)
-                clean_reasoning_log.append(clean_entry)
-            
-            # Send final completion event with results summary
-            from django.conf import settings
-            output_dir = settings.MEDIA_ROOT  # Use Django's configured media root
-            output_files = []
-            if os.path.exists(output_dir):
-                output_files = [f for f in os.listdir(output_dir) if f.endswith(('.tif', '.geojson'))]
-            
-            completion_data = {
-                'type': 'complete', 
-                'message': '🎉 Geospatial analysis complete! Map published to GeoServer.',
-                'total_steps': step_count,
-                'output_files': output_files,
-                'workflow_log': clean_workflow_log,
-                'reasoning_log': clean_reasoning_log,
-                'final_map_result': final_result,
-                'download_ready': True
-            }
-            
-            # Final safety check for JSON serialization
-            try:
-                json.dumps(completion_data)
-                yield f"data: {json.dumps(completion_data)}\n\n"
-            except (TypeError, ValueError) as e:
-                # Fallback response if there are still serialization issues
-                fallback_data = {
-                    'type': 'complete',
-                    'message': '🎉 Geospatial analysis complete! Map published to GeoServer.',
-                    'total_steps': step_count,
-                    'output_files': output_files,
-                    'final_map_result': final_result,
-                    'download_ready': True,
-                    'serialization_warning': f'Some data excluded due to serialization issues: {str(e)}'
-                }
-                yield f"data: {json.dumps(fallback_data)}\n\n"
-
-        response = StreamingHttpResponse(event_stream_generator(), content_type="text/event-stream")
-        response['Cache-Control'] = 'no-cache'
-        return response
-
-    except Exception as e:
-        print(f"❌ An error occurred: {e}")
-        # Cannot return a streaming response on error, so use JSON
-        return JsonResponse({'error': str(e)}, status=500)
-
-@csrf_exempt
-def get_output_files(request):
-    """
-    Returns a list of available output files for download.
-    """
-    try:
-        from django.conf import settings
-        output_dir = settings.MEDIA_ROOT  # Use Django's configured media root
-        output_files = []
-        if os.path.exists(output_dir):
-            for filename in os.listdir(output_dir):
-                if filename.endswith(('.tif', '.geojson')):
-                    file_path = os.path.join(output_dir, filename)
-                    file_size = os.path.getsize(file_path)
-                    output_files.append({
-                        'name': filename,
-                        'size': file_size,
-                        'type': 'raster' if filename.endswith('.tif') else 'vector'
-                    })
+        thread = AnalysisThread.objects.get(id=thread_id) if thread_id else AnalysisThread.objects.create(title=query[:50])
         
-        return JsonResponse({'files': output_files})
-    except Exception as e:
-        return JsonResponse({'error': str(e)}, status=500)
+        response_model = get_planner_agent().invoke({"input": query})
+        
+        message = ThreadMessage.objects.create(
+            thread=thread,
+            user_query=query,
+            agent_explanation=response_model.overall_reasoning,
+            agent_workflow_plan=response_model.dict()
+        )
+        
+        return Response({
+            "thread_id": thread.id,
+            "plan_id": message.id,
+            "workflow_plan": response_model.dict()
+        })
+
+class ExecutorView(APIView):
+    """Handles the execution stage: User-Approved Plan -> Streaming Log & Final Map."""
+    def post(self, request, *args, **kwargs):
+        plan_id = request.data.get('plan_id')
+        edited_plan_dict = request.data.get('workflow_plan')
+
+        message = ThreadMessage.objects.get(id=plan_id)
+        message.user_edited_workflow_plan = edited_plan_dict
+        message.save()
+        
+        plan = edited_plan_dict.get('plan', [])
+
+        def event_stream_generator():
+            logs = []
+            step_outputs = {}
+            final_result = None
+
+            # Clean output directory before starting
+            output_dir = settings.MEDIA_ROOT
+            if os.path.exists(output_dir): shutil.rmtree(output_dir)
+            os.makedirs(output_dir)
+
+            try:
+                for i, step in enumerate(plan):
+                    step_num = i + 1
+                    tool_name = step['tool_name']
+                    params_list = step['parameters']
+                    params_for_call = {p['name']: p['value'] for p in params_list}
+
+                    for key, value in params_for_call.items():
+                        if isinstance(value, str) and value.startswith("##step_"):
+                            ref_step = int(value.split('_')[1])
+                            params_for_call[key] = step_outputs[ref_step]
+                    
+                    log_entry = {'type': 'log', 'content': f'▶️ Step {step_num}: Executing `{tool_name}`...'}
+                    logs.append(log_entry)
+                    yield f"data: {json.dumps(log_entry)}\n\n"
+                    
+                    tool_function = TOOL_MAPPING[tool_name]
+                    result = tool_function(**params_for_call)
+
+                    if isinstance(result, str) and result.lower().startswith("error:"):
+                        raise Exception(result)
+
+                    step_outputs[step_num] = result
+                    log_entry = {'type': 'log', 'content': f'✅ Step {step_num} complete. Output: {result}'}
+                    logs.append(log_entry)
+                    yield f"data: {json.dumps(log_entry)}\n\n"
+                    
+                    if i == len(plan) - 1:
+                        final_result = result
+
+            except Exception as e:
+                log_entry = {'type': 'error', 'content': f'❌ Workflow FAILED at Step {step_num} ({tool_name}): {e}'}
+                logs.append(log_entry)
+                yield f"data: {json.dumps(log_entry)}\n\n"
+                message.execution_log = logs
+                message.save()
+                return
+
+            message.execution_log = logs
+            message.final_map_result = final_result
+            message.save()
+            
+            yield f"data: {json.dumps({'type': 'complete', 'content': '🎉 Workflow Finished!', 'map_result': final_result})}\n\n"
+        
+        return StreamingHttpResponse(event_stream_generator(), content_type="text/event-stream")
