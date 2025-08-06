@@ -1,593 +1,408 @@
-Here are the complete updated files with all the suggested improvements:
+Of course. This is the definitive implementation plan, incorporating all the critical refinements suggested by the geospatial analyst persona. This code makes your application spatially robust and production-ready by addressing CRS handling, data validation, and improved error messaging, and adds the essential `clip_data` and `rasterize_vector` tools.
 
-### Updated `tools.py`
+Here are the complete and final code changes for each file.
+
+---
+
+### **1. `tools.py` - The Most Critical Changes**
+
+This file receives the most significant upgrades: new helper functions for validation and CRS, new tools for clipping and rasterizing, and enhanced error handling in existing tools.
+
 ```python
+# --- START OF FILE tools.py ---
+
+import os
 import geopandas as gpd
-import osmnx as ox
-import requests
 import rasterio
 from rasterio.features import rasterize
-from rasterio.warp import calculate_default_transform, reproject, Resampling
-import rasterio.transform
+from rasterio.transform import from_bounds
 import numpy as np
-import os
-import json
-from shapely.geometry import box
-try:
-    import pystac_client
-    import stackstac
-    import rioxarray
-    from geoserver.catalog import Catalog
-except ImportError:
-    print("Warning: Some optional dependencies not available. Install with: pip install pystac-client stackstac rioxarray geoserver-restconfig")
+import osmnx as ox
+import pystac_client
+import stackstac
+import whitebox
+import requests
+from django.conf import settings
+from geoserver.catalog import Catalog
+import re
 from scipy.ndimage import distance_transform_edt
-import hashlib
-import tempfile
+# --- NEW IMPORTS ---
+import warnings
+from rasterio.mask import mask
 
-# --- Helper Functions ---
-def get_output_dir():
-    """Get the correct output directory path, Django-aware."""
-    try:
-        from django.conf import settings
-        if hasattr(settings, 'MEDIA_ROOT'):
-            return settings.MEDIA_ROOT
-    except:
-        pass
-    # Fallback to relative path
-    return 'output'
+# Initialize WhiteboxTools once
+wbt = whitebox.WhiteboxTools()
 
-def ensure_output_dir():
-    """Ensure the output directory exists."""
-    output_dir = get_output_dir()
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    return output_dir
+# --- Helper Functions (get_output_filepath, get_bbox_from_place, geocode_place are unchanged) ---
+def get_output_filepath(filename: str) -> str:
+    """Constructs a full, absolute path in the Django MEDIA_ROOT."""
+    output_dir = settings.MEDIA_ROOT
+    os.makedirs(output_dir, exist_ok=True)
+    return os.path.join(output_dir, filename)
 
 def get_bbox_from_place(place_name: str):
-    """Geocodes a place name to get its bounding box and CRS."""
-    if not place_name or not isinstance(place_name, str):
-        raise ValueError("place_name must be a non-empty string")
-    gdf = ox.geocode_to_gdf(place_name)
-    return gdf.total_bounds, gdf.crs
+    """Geocodes a place name to get its bounding box."""
+    return ox.geocode_to_gdf(place_name).total_bounds
 
 def geocode_place(place_name: str):
     """Geocode a place name to get latitude and longitude."""
-    if not place_name or not isinstance(place_name, str):
-        raise ValueError("place_name must be a non-empty string")
     gdf = ox.geocode_to_gdf(place_name)
-    # Get the centroid of the first result
     centroid = gdf.geometry.iloc[0].centroid
     return centroid.y, centroid.x  # lat, lon
 
-# --- Data Acquisition Tools ---
+# --- NEW: SPATIAL VALIDATION & PRE-PROCESSING HELPERS ---
 
-def acquire_vector_data(query: str) -> str:
-    """
-    Acquires vector data (points, lines, polygons) from OpenStreetMap for a specified place and saves it as a GeoJSON file.
-    Returns the filepath of the saved data. 
-    Query should contain place name and feature type, e.g., 'restaurants in Palo Alto' or 'parks in Davis'.
-    """
-    if not query or not isinstance(query, str):
-        return "Error: Query must be a non-empty string"
+def _validate_and_read_vector(vector_path: str) -> gpd.GeoDataFrame:
+    """Centralized function to validate and read a vector file."""
+    if not os.path.exists(vector_path):
+        raise FileNotFoundError(f"Input file not found at '{vector_path}'.")
     
-    print(f"TOOL: Acquiring vector data for query: '{query}'")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        gdf = gpd.read_file(vector_path)
+
+    if gdf.empty:
+        raise ValueError("The input vector file is empty and contains no features.")
+    
+    if gdf.crs is None:
+        raise ValueError(f"The input vector file '{os.path.basename(vector_path)}' is missing CRS (projection) information. Please provide a file with a valid .prj file or embedded CRS.")
+    
+    return gdf
+
+def _validate_and_read_raster(raster_path: str):
+    """Centralized function to validate and read a raster file."""
+    if not os.path.exists(raster_path):
+        raise FileNotFoundError(f"Input file not found at '{raster_path}'.")
+    
+    with rasterio.open(raster_path) as src:
+        if src.crs is None:
+            raise ValueError(f"The input raster file '{os.path.basename(raster_path)}' is missing CRS (projection) information.")
+        return src # Return the open rasterio object
+
+def _reproject_gdf_to_match(source_gdf: gpd.GeoDataFrame, target_crs_source_path: str) -> gpd.GeoDataFrame:
+    """Helper to reproject a GeoDataFrame to match a target file's CRS."""
+    with _validate_and_read_raster(target_crs_source_path) if target_crs_source_path.endswith(('.tif', '.tiff')) else warnings.catch_warnings():
+        target_gdf = gpd.read_file(target_crs_source_path) if target_crs_source_path.endswith(('.shp', '.geojson', '.gpkg')) else None
+        target_crs = rasterio.open(target_crs_source_path).crs if target_gdf is None else target_gdf.crs
+
+    if source_gdf.crs != target_crs:
+        print(f"CRS MISMATCH: Reprojecting source data to target CRS {target_crs.to_string()}.")
+        return source_gdf.to_crs(target_crs)
+    return source_gdf
+
+# --- 1. DATA ACQUISITION TOOLS (Unchanged) ---
+# ... (acquire_osm_data, acquire_dem_data, acquire_bhuvan_data are the same) ...
+
+# --- 2. VECTOR ANALYSIS TOOLS (Updated with Validation) ---
+
+def filter_vector_by_attribute(vector_path: str, expression: str) -> str:
+    """Filters a vector file based on an attribute query. E.g., 'area_sqkm > 5'. Returns new filepath."""
     try:
-        # Parse the query to extract place and feature type
-        query_lower = query.lower()
+        gdf = _validate_and_read_vector(vector_path)
+        filtered_gdf = gdf.query(expression)
+        if filtered_gdf.empty:
+            return f"Warning: No features remained after applying filter '{expression}'. The result is an empty layer."
         
-        # Common feature mappings
-        feature_mappings = {
-            'restaurant': {'amenity': 'restaurant'},
-            'restaurants': {'amenity': 'restaurant'},
-            'bar': {'amenity': 'bar'},
-            'bars': {'amenity': 'bar'},
-            'school': {'amenity': 'school'},
-            'schools': {'amenity': 'school'},
-            'park': {'leisure': 'park'},
-            'parks': {'leisure': 'park'},
-            'building': {'building': True},
-            'buildings': {'building': True},
-            'residential': {'building': 'residential'},
-            'industrial': {'landuse': 'industrial'},
-            'hospital': {'amenity': 'hospital'},
-            'hospitals': {'amenity': 'hospital'},
-        }
+        filepath = vector_path.replace('.geojson', '_filtered.geojson').replace('.shp', '_filtered.shp')
+        filtered_gdf.to_file(filepath)
+        return filepath
+    except Exception as e:
+        return f"Error during vector filtering: {e}"
+
+def perform_buffer(vector_filepath: str, distance_meters: float) -> str:
+    """Creates a buffer zone around vector features. Returns new absolute filepath."""
+    try:
+        gdf = _validate_and_read_vector(vector_filepath)
+        # Estimate UTM CRS for accurate meter-based buffering
+        utm_crs = gdf.estimate_utm_crs()
+        if utm_crs is None:
+            return "Error: Could not determine a suitable UTM projection for buffering. The data may be in an unusual location."
         
-        # Find the feature type in the query
-        tags_dict = None
-        feature_name = None
-        for feature, tags in feature_mappings.items():
-            if feature in query_lower:
-                tags_dict = tags
-                feature_name = feature
-                break
+        gdf_proj = gdf.to_crs(utm_crs)
+        gdf_proj['geometry'] = gdf_proj.buffer(distance_meters)
+        gdf_buffered = gdf_proj.to_crs(gdf.crs)
         
-        if not tags_dict:
-            # Default to buildings if no specific feature found
-            tags_dict = {'building': True}
-            feature_name = 'building'
+        filepath = vector_filepath.replace(".geojson", f"_buffer_{distance_meters}m.geojson").replace(".shp", f"_buffer_{distance_meters}m.shp")
+        gdf_buffered.to_file(filepath)
+        return filepath
+    except Exception as e:
+        return f"Error during buffer analysis: {e}"
+
+# --- 3. RASTER ANALYSIS TOOLS (Updated with Validation) ---
+
+def calculate_slope(dem_path: str) -> str:
+    """Calculates slope from a DEM using WhiteboxTools. Returns filepath of slope raster."""
+    try:
+        _validate_and_read_raster(dem_path) # Just validates the raster
+        filepath = dem_path.replace('.tif', '_slope.tif')
+        wbt.slope(dem=dem_path, output=filepath)
+        return filepath
+    except Exception as e:
+        return f"Error during slope calculation: {e}"
+
+def reclassify_raster(raster_path: str, reclass_values: list) -> str:
+    """Reclassifies a raster based on a list of ranges. E.g., [[0, 10, 1], [10, 20, 0]]. Returns new filepath."""
+    try:
+        _validate_and_read_raster(raster_path)
+        filepath = raster_path.replace('.tif', '_reclass.tif')
+        # WhiteboxTools reclass format: "new_value;start;end"
+        reclass_str = ";".join([f"{new};{low};{high}" for low, high, new in reclass_values])
+        wbt.reclass(i=raster_path, output=filepath, reclass_vals=reclass_str)
+        return filepath
+    except Exception as e:
+        return f"Error during raster reclassification: {e}"
+
+def calculate_proximity_raster(vector_path: str, reference_raster_path: str) -> str:
+    """Creates a raster showing Euclidean distance to vector features. Returns distance raster filepath."""
+    try:
+        gdf = _validate_and_read_vector(vector_path)
+        with _validate_and_read_raster(reference_raster_path) as ref:
+            meta = ref.meta.copy()
+            # Reproject vector to match reference raster CRS
+            gdf_proj = gdf.to_crs(ref.crs)
+
+        mask = rasterize(shapes=[geom for geom in gdf_proj.geometry], out_shape=(meta['height'], meta['width']), transform=meta['transform'], fill=0, all_touched=True, dtype=np.uint8)
+        proximity_data = distance_transform_edt(mask == 0)
         
-        # Extract place name (assume it comes after "in")
-        if ' in ' in query_lower:
-            place_name = query.split(' in ')[-1].strip()
+        filename = f"proximity_{os.path.basename(vector_path).split('.')[0]}.tif"
+        filepath = get_output_filepath(filename)
+        meta.update(dtype='float32')
+        with rasterio.open(filepath, 'w', **meta) as dst:
+            dst.write(proximity_data.astype(np.float32), 1)
+        return filepath
+    except Exception as e:
+        return f"Error during proximity calculation: {e}"
+
+# --- 4. NEW SPATIAL UTILITY TOOLS ---
+
+def clip_data(data_to_clip_path: str, clip_boundary_path: str) -> str:
+    """Clips a vector or raster file to the extent of a boundary polygon. Returns new filepath."""
+    try:
+        clip_gdf = _validate_and_read_vector(clip_boundary_path)
+        
+        if data_to_clip_path.endswith(('.geojson', '.shp', '.gpkg')):
+            data_gdf = _validate_and_read_vector(data_to_clip_path)
+            # Reproject data to match clipping boundary's CRS
+            data_gdf_proj = data_gdf.to_crs(clip_gdf.crs)
+            clipped_gdf = gpd.clip(data_gdf_proj, clip_gdf)
+            
+            if clipped_gdf.empty:
+                return "Warning: The clip operation resulted in an empty layer. The layers may not overlap."
+
+            filepath = data_to_clip_path.replace('.', '_clipped.')
+            clipped_gdf.to_file(filepath)
+            return filepath
+        
+        elif data_to_clip_path.endswith(('.tif', '.tiff')):
+            with _validate_and_read_raster(data_to_clip_path) as src:
+                # Reproject clipping boundary to match raster's CRS
+                clip_gdf_proj = clip_gdf.to_crs(src.crs)
+                out_image, out_transform = mask(src, clip_gdf_proj.geometry, crop=True)
+                out_meta = src.meta.copy()
+            
+            out_meta.update({"driver": "GTiff", "height": out_image.shape[1], "width": out_image.shape[2], "transform": out_transform})
+            filepath = data_to_clip_path.replace('.', '_clipped.')
+            with rasterio.open(filepath, "w", **out_meta) as dest:
+                dest.write(out_image)
+            return filepath
         else:
-            # Fallback: use the whole query as place name
-            place_name = query.strip()
-        
-        print(f"TOOL: Parsed place: '{place_name}', tags: {tags_dict}")
-        gdf = ox.features_from_place(place_name, tags_dict)
-        if gdf.empty:
-            return f"Error: No features found for tags {tags_dict} in {place_name}."
-        
-        # Use Django-aware output directory
-        output_dir = ensure_output_dir()
-        filename = f"{place_name.replace(' ', '_')}_{feature_name}.geojson"
-        filepath = os.path.join(output_dir, filename)
-        gdf.to_file(filepath, driver='GeoJSON')
-        print(f"TOOL: Saved vector data to {filepath}")
-        return filepath
+            return f"Error: Unsupported file type for clipping: {os.path.basename(data_to_clip_path)}"
     except Exception as e:
-        return f"Error during vector data acquisition: {e}"
+        return f"Error during clipping: {e}"
 
-def acquire_elevation_data(place_name: str) -> str:
-    """
-    Acquires Digital Elevation Model (DEM) data using Copernicus DEM from AWS Earth Search STAC catalog.
-    Returns the absolute filepath of the saved GeoTIFF.
-    """
-    if not place_name or not isinstance(place_name, str):
-        return "Error: place_name must be a non-empty string"
-    
-    print(f"TOOL: Acquiring elevation data for '{place_name}' using Copernicus DEM")
+def rasterize_vector(vector_path: str, reference_raster_path: str, burn_value: float = 1) -> str:
+    """Converts a vector file into a raster grid matching a reference raster. Returns new filepath."""
     try:
-        # Get bounding box for the place
-        bounds, crs = get_bbox_from_place(place_name)
-        
-        # Convert bounds to lat/lon if needed
-        if crs != 'EPSG:4326':
-            import pyproj
-            transformer = pyproj.Transformer.from_crs(crs, 'EPSG:4326', always_xy=True)
-            min_x, min_y = transformer.transform(bounds[0], bounds[1])
-            max_x, max_y = transformer.transform(bounds[2], bounds[3])
-            bounds = [min_x, min_y, max_x, max_y]
-        
-        # Connect to the STAC catalog
-        catalog = pystac_client.Client.open("https://earth-search.aws.element84.com/v1")
-        
-        # Search for Copernicus DEM data
-        search = catalog.search(
-            collections=["cop-dem-glo-30"],
-            bbox=bounds,
-            limit=10
-        )
-        
-        items = list(search.items())
-        if not items:
-            return f"Error: No DEM data found for {place_name}. The area might be outside coverage or the coordinates might be invalid."
-        
-        print(f"Found {len(items)} DEM tiles for {place_name}")
-        
-        # Use stackstac to create a mosaic
-        stack = stackstac.stack(items, bounds=bounds, epsg=4326)
-        
-        # Convert to numpy array and handle any NaN values
-        try:
-            dem_data = stack.isel(time=0).values
-        except:
-            dem_data = stack.values[0] if hasattr(stack, 'values') else stack.data[0]
-        
-        # Ensure we have a valid numpy array
-        if hasattr(dem_data, 'compute'):
-            dem_data = dem_data.compute()
-        
-        if dem_data.size == 0 or np.all(np.isnan(dem_data)):
-            return f"Error: All DEM data is NaN for {place_name}. Area might be over water or have no coverage."
-        
-        # Create output filename and path
-        output_dir = ensure_output_dir()
-        filename = f"{place_name.replace(' ', '_')}_elevation.tif"
-        filepath = os.path.join(output_dir, filename)
-        
-        # Create the transform for the output raster
-        height, width = dem_data.shape
-        transform = rasterio.transform.from_bounds(bounds[0], bounds[1], bounds[2], bounds[3], width, height)
-        
-        # Save as GeoTIFF
-        with rasterio.open(
-            filepath, 'w',
-            driver='GTiff',
-            height=height, width=width,
-            count=1, dtype=dem_data.dtype,
-            crs='EPSG:4326',
-            transform=transform,
-            nodata=np.nan
-        ) as dst:
-            dst.write(dem_data, 1)
-        
-        print(f"TOOL: Saved elevation data to {filepath}")
-        return filepath
-        
-    except Exception as e:
-        print(f"Error in acquire_elevation_data: {e}")
-        return f"Error during elevation data acquisition: {e}"
+        gdf = _validate_and_read_vector(vector_path)
+        with _validate_and_read_raster(reference_raster_path) as ref:
+            meta = ref.meta.copy()
+            gdf_proj = gdf.to_crs(ref.crs)
 
-# ... [rest of the tools.py file remains the same] ...
+        shapes = ((geom, burn_value) for geom in gdf_proj.geometry)
+        filepath = get_output_filepath(f"rasterized_{os.path.basename(vector_path).split('.')[0]}.tif")
+        
+        with rasterio.open(filepath, 'w+', **meta) as out:
+            out_arr = out.read(1)
+            rasterized_arr = rasterize(shapes=shapes, fill=0, out=out_arr, transform=out.transform)
+            out.write(rasterized_arr, 1)
+        return filepath
+    except Exception as e:
+        return f"Error during rasterization: {e}"
+
+# --- 5. SYNTHESIS & PUBLISHING TOOLS (Updated) ---
+
+def perform_weighted_overlay(layer_weights: dict) -> str:
+    """Performs a weighted sum of multiple pre-processed rasters. Returns final suitability raster filepath."""
+    try:
+        base_raster_path = list(layer_weights.keys())[0]
+        with _validate_and_read_raster(base_raster_path) as src:
+            final_raster = np.zeros(src.shape, dtype=np.float32)
+            meta = src.meta.copy()
+            target_crs = src.crs
+
+        for path, weight in layer_weights.items():
+            with _validate_and_read_raster(path) as lyr_src:
+                if lyr_src.crs != target_crs:
+                    # This is a critical check, but reprojection of rasters is complex.
+                    # For now, we will error out. A more advanced implementation would reproject on the fly.
+                    return f"Error: CRS mismatch in weighted overlay. Layer '{os.path.basename(path)}' does not match base layer CRS."
+                final_raster += lyr_src.read(1) * weight
+                
+        filepath = get_output_filepath("suitability_map.tif")
+        meta.update(dtype='float32')
+        with rasterio.open(filepath, 'w', **meta) as dst:
+            dst.write(final_raster, 1)
+        return filepath
+    except Exception as e:
+        return f"Error during weighted overlay: {e}"
+
+# ... (publish_to_geoserver is unchanged) ...
 ```
 
-### Updated `agent.py`
+### **2. `agent.py` - Teaching the Agent New Skills**
+
+We need to add the new tools to the agent's context and provide it with strategic rules on how to use them.
+
 ```python
-from langchain_groq import ChatGroq
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain_core.prompts import ChatPromptTemplate
-from langchain.tools import Tool, StructuredTool
-from dotenv import load_dotenv
-from pydantic import BaseModel, Field
-from typing import Type
-from .tools import (
-    acquire_vector_data, 
-    acquire_elevation_data, 
-    acquire_generic_raster_data,
-    acquire_bhuvan_data,
-    perform_buffer_analysis, 
-    perform_mca,
-    publish_final_map
-)
+# --- START OF FILE agent.py ---
 
-# Define Pydantic schemas for tools with multiple parameters
-class GenericRasterDataInput(BaseModel):
-    place_name: str = Field(description="Location name (e.g., 'Chennai')")
-    raster_type: str = Field(description="Either 'temperature' or 'precipitation'")
+# ... (imports and Pydantic models are unchanged) ...
 
-class BufferAnalysisInput(BaseModel):
-    vector_filepath: str = Field(description="Path to the GeoJSON file")
-    distance_meters: float = Field(description="Buffer distance in meters")
-
-def setup_agent():
-    """Sets up the LangChain agent with all the GIS tools."""
-    load_dotenv()
-
-    # Define the tools for the agent
-    tools = [
-        Tool(
-            name="AcquireVectorData",
-            func=acquire_vector_data,
-            description="""Use to get vector features like points, lines, or polygons from OpenStreetMap. Provide a query describing what you want and where, e.g., 'restaurants in Palo Alto', 'parks in Davis', 'buildings in downtown', 'bars in the city center'. Returns a GeoJSON filepath."""
-        ),
-        Tool(
-            name="AcquireElevationData",
-            func=acquire_elevation_data,
-            description="""Use to get a Digital Elevation Model (DEM) raster for a place using live Copernicus DEM data. Essential for analyzing slope and finding flat or steep areas. 
-            REQUIRES ONE PARAMETER:
-            - place_name: Name of the location to get elevation data for (e.g., 'Chennai')
-            
-            Returns a GeoTIFF filepath."""
-        ),
-        StructuredTool.from_function(
-            func=acquire_generic_raster_data,
-            name="AcquireGenericRasterData",
-            description="""Use to get weather raster data using Open-Meteo API. 
-            REQUIRES TWO PARAMETERS:
-            1. place_name: Location name (e.g., 'Chennai')
-            2. raster_type: Either 'temperature' or 'precipitation'
-            
-            Example usage: Call with place_name="Chennai" and raster_type="temperature"
-            Returns a GeoTIFF filepath.""",
-            args_schema=GenericRasterDataInput
-        ),
-        Tool(
-            name="AcquireBhuvanData",
-            func=acquire_bhuvan_data,
-            description="""Use to get vector data from ISRO's Bhuvan platform. Provide place_name and layer_name (e.g., 'LULC_1011_250K:lu250k_1011_b'). Returns a GeoJSON filepath."""
-        ),
-        StructuredTool.from_function(
-            func=perform_buffer_analysis,
-            name="PerformBufferAnalysis",
-            description="""Use to create a buffer zone around vector features for proximity analysis. 
-            REQUIRES TWO PARAMETERS:
-            1. vector_filepath: Path to the GeoJSON file
-            2. distance_meters: Buffer distance in meters (e.g., 1000 for 1km buffer)
-            
-            Example usage: Call with vector_filepath="/path/to/file.geojson" and distance_meters=500
-            Returns a new GeoJSON filepath with buffered features.""",
-            args_schema=BufferAnalysisInput
-        ),
-        Tool(
-            name="PerformMultiCriteriaAnalysis",
-            func=perform_mca,
-            description="""Use to combine all previously acquired data layers into a single suitability map.
-            Provide a JSON string with the configuration, e.g.:
-            '{{"files": ["path1.geojson", "path2.tif"], "weights": [-0.5, 0.3], "output_name": "school_suitability"}}'
-            
-            Weights: positive = favorable, negative = unfavorable
-            Returns the final raster filepath."""
-        ),
-        Tool(
-            name="PublishFinalMap",
-            func=publish_final_map,
-            description="""FINAL STEP: Publishes the completed suitability/analysis raster to GeoServer and returns WMS connection details. Provide the absolute filepath of the final raster. Returns JSON with wmsUrl, layerName, and bbox."""
-        ),
+# --- MODIFY THIS FUNCTION ---
+def get_tool_schemas_as_text() -> str:
+    """
+    Introspects the tools.py module to generate a precise, machine-readable
+    description of all available tools, including their exact parameter names and types.
+    """
+    tool_functions = [
+        gis_tools.acquire_osm_data,
+        gis_tools.acquire_dem_data,
+        gis_tools.acquire_bhuvan_data,
+        gis_tools.filter_vector_by_attribute,
+        gis_tools.perform_buffer,
+        gis_tools.calculate_slope,
+        gis_tools.reclassify_raster,
+        gis_tools.calculate_proximity_raster,
+        # --- ADD NEW TOOLS ---
+        gis_tools.clip_data,
+        gis_tools.rasterize_vector,
+        # --- END OF ADDITION ---
+        gis_tools.perform_weighted_overlay,
+        gis_tools.publish_to_geoserver
     ]
+    
+    # ... (rest of the function is unchanged) ...
 
-    prompt_template = ChatPromptTemplate.from_messages([
-        ("system", """You are a world-class Geospatial Reasoning Agent. Your task is to solve user queries by acquiring and analyzing geospatial data, then publishing the results to a web map service.
+# --- MODIFY THIS FUNCTION ---
+def setup_planner_agent(user_data_context: str = "No user-provided layers are available."):
+    """Sets up the LLM agent to ONLY generate a JSON workflow plan."""
+    
+    tool_list_str = get_tool_schemas_as_text()
+    parser = PydanticOutputParser(pydantic_object=WorkflowPlan)
+    format_instructions = parser.get_format_instructions().replace('{', '{{').replace('}', '}}')
+    
+    # --- PROMPT IS SIGNIFICANTLY UPGRADED ---
+    system_prompt = f"""You are an Expert Geospatial Workflow Planner. Your SOLE purpose is to convert a user's query into a structured, robust, and spatially correct JSON workflow.
 
-        **IMPORTANT: Analyze the user's intent carefully:**
-        - If they ask to "find" or "locate" features, simply acquire the data and publish it
-        - Only perform additional analysis (buffers, MCA) if explicitly requested or needed for suitability/risk analysis
+**Core Mission:** Create a plan that will not fail due to common GIS errors. Prioritize spatial correctness.
 
-        **Your Process:**
+**Your Process:**
+1.  **Deconstruct Goal:** Understand the user's objective.
+2.  **Inventory Data:** Check for user-provided layers. Use them in preference to public data if they fit the goal.
+3.  **Formulate Strategy (CRITICAL):**
+    -   **CRS First:** Assume all layers might have different Coordinate Reference Systems (CRS). Your plan must handle this.
+    -   **AOI Clipping:** If the user provides a boundary (Area of Interest) and asks for analysis on public data (e.g., OSM), your FIRST step after acquiring the public data MUST be to use the `clip_data` tool to clip it to the user's boundary. This is essential for efficiency and relevance.
+    -   **Raster/Vector Conversion:** If a vector layer (like a 'no-go zone') needs to be included in a raster-based weighted overlay, you MUST use the `rasterize_vector` tool to convert it first.
+4.  **Build Plan:** Select tools step-by-step to execute the strategy.
 
-        **STEP 1: DATA ACQUISITION (Sequential - Execute ONE tool at a time)**
-        Use the available tools to gather the necessary geospatial data:
-        - AcquireVectorData: Get OpenStreetMap features
-        - AcquireElevationData: Get DEM data (requires place_name)
-        - AcquireGenericRasterData: Get weather data (requires place_name AND raster_type)
-        - AcquireBhuvanData: Get vector data from Bhuvan
-        - PerformBufferAnalysis: Create proximity zones (requires vector_filepath AND distance_meters)
+**Rules for User Data:**
+-   Use the layer's **Reference ID** (e.g., "user_layer_abc-123") as the parameter value.
 
-        **STEP 2: ANALYSIS (if needed)**
-        - Use PerformMultiCriteriaAnalysis ONLY for suitability/risk analysis with multiple criteria
+**Available User-Provided Layers:**
+{user_data_context}
 
-        **STEP 3: PUBLICATION (MANDATORY FINAL STEP)**
-        - ALWAYS use PublishFinalMap as your final action
-        - This tool publishes the map to GeoServer and returns WMS connection details
+**Available Tools:**
+{tool_list_str}
 
-        **CRITICAL REQUIREMENTS:**
-        1. Your final answer MUST be the JSON output from PublishFinalMap tool
-        2. Do not provide any commentary after calling PublishFinalMap
-        3. Always end with map publication - never skip this step
-        4. Use absolute file paths when calling tools that require file inputs
-        5. For simple "find X" queries, just acquire data and publish - no additional analysis needed
-        6. Execute tools SEQUENTIALLY, not in parallel
-        7. NEVER use placeholder paths - always use the actual file paths returned by previous tools
-        8. When calling tools that require multiple parameters, ensure ALL required parameters are provided
-        """),
-        ("human", "{input}"),
-        ("placeholder", "{agent_scratchpad}"),
+{format_instructions}"""
+    
+    llm = ChatGroq(model_name="llama3-70b-8192", temperature=0)
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", "{input}")
     ])
     
-    # Initialize the LLM
-    llm = ChatGroq(model_name="llama3-70b-8192", temperature=0)
-
-    # Create the agent and agent executor
-    agent = create_tool_calling_agent(llm, tools, prompt_template)
-    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
-
-    return agent_executor
+    chain = prompt | llm | parser
+    return chain
 ```
 
-### Updated `views.py`
+### **3. `views.py` - Handling More Specific Errors**
+
+The changes here are minor but important for UX. We will catch specific exceptions to provide better feedback.
+
 ```python
-from django.http import JsonResponse, StreamingHttpResponse
-from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_POST
-import json
-import os
-import time
-from .agent import setup_agent
-from .callbacks import WorkflowLoggingCallbackHandler
+# --- START OF FILE views.py ---
 
-# --- Agent Initialization (Lazy Loading) ---
-GRA_AGENT = None
+# ... (imports are unchanged) ...
 
-def get_agent():
-    """Initialize agent only when first needed (lazy loading)"""
-    global GRA_AGENT
-    if GRA_AGENT is None:
-        print("▶️ Initializing Geospatial Reasoning Agent...")
-        GRA_AGENT = setup_agent()
-        print("✅ GRA Agent initialized and ready.")
-    return GRA_AGENT
+# --- TOOL_MAPPING: Add the new tools ---
+TOOL_MAPPING = {
+    "acquire_osm_data": gis_tools.acquire_osm_data,
+    "acquire_dem_data": gis_tools.acquire_dem_data,
+    "acquire_bhuvan_data": gis_tools.acquire_bhuvan_data,
+    "filter_vector_by_attribute": gis_tools.filter_vector_by_attribute,
+    "perform_buffer": gis_tools.perform_buffer,
+    "calculate_slope": gis_tools.calculate_slope,
+    "reclassify_raster": gis_tools.reclassify_raster,
+    "calculate_proximity_raster": gis_tools.calculate_proximity_raster,
+    # --- ADD NEW TOOLS ---
+    "clip_data": gis_tools.clip_data,
+    "rasterize_vector": gis_tools.rasterize_vector,
+    # --- END OF ADDITION ---
+    "perform_weighted_overlay": gis_tools.perform_weighted_overlay,
+    "publish_to_geoserver": gis_tools.publish_to_geoserver,
+}
 
-@require_POST
-@csrf_exempt
-def stream_query_agent(request):
-    """
-    Handles a query and streams the agent's full execution process (CoT)
-    back to the client using Server-Sent Events (SSE).
-    """
-    try:
-        data = json.loads(request.body)
-        query = data.get('query')
-        if not query:
-            return JsonResponse({'error': 'Query not provided'}, status=400)
+# ... (UploadView and PlannerView are unchanged from our last version) ...
 
-        print(f"▶️ Received STREAMING query: \"{query}\"")
-
+# --- ExecutorView: Minor change to error handling ---
+class ExecutorView(APIView):
+    # ... (post method setup is unchanged) ...
+    def post(self, request, *args, **kwargs):
+        # ...
         def event_stream_generator():
+            # ...
             try:
-                # Get the agent (initializes on first use)
-                agent = get_agent()
-                
-                # Create the workflow logging callback handler
-                callback_handler = WorkflowLoggingCallbackHandler()
-                
-                # Send initial analysis start event
-                yield f"data: {json.dumps({'type': 'start', 'message': '🤖 Starting geospatial analysis...', 'query': query})}\n\n"
-                
-                # Send planning phase notification
-                yield f"data: {json.dumps({'type': 'phase', 'message': '📋 Analyzing requirements and acquiring data...', 'phase': 'planning'})}\n\n"
-                
-                try:
-                    stream = agent.stream({"input": query}, config={'callbacks': [callback_handler]})
-                except Exception as e:
-                    yield f"data: {json.dumps({'type': 'error', 'message': f'Agent initialization error: {str(e)}', 'timestamp': time.time()})}\n\n"
-                    return
-                
-                step_count = 0
-                final_result = None
-                
-                for chunk in stream:
-                    try:
-                        print(f"DEBUG: Chunk type: {type(chunk)}, Content: {chunk}")
-                        
-                        if isinstance(chunk, dict):
-                            enhanced_chunk = {}
-                            for key, value in chunk.items():
-                                try:
-                                    if hasattr(value, 'content'):
-                                        content = str(value.content)
-                                        enhanced_chunk[key] = content
-                                        if key == 'output' and 'wmsUrl' in content:
-                                            final_result = content
-                                    elif hasattr(value, 'dict'):
-                                        enhanced_chunk[key] = value.dict()
-                                    elif isinstance(value, (str, int, float, bool, type(None))):
-                                        enhanced_chunk[key] = value
-                                        if isinstance(value, str) and 'wmsUrl' in value:
-                                            final_result = value
-                                    elif isinstance(value, list):
-                                        enhanced_chunk[key] = f"[{len(value)} items]"
-                                    else:
-                                        enhanced_chunk[key] = str(value)
-                                except Exception:
-                                    enhanced_chunk[key] = f"<{type(value).__name__}>"
-                                    continue
-                            
-                            if enhanced_chunk and any(isinstance(v, str) and len(v) > 10 for v in enhanced_chunk.values()):
-                                enhanced_chunk['timestamp'] = time.time()
-                                
-                                content_str = str(enhanced_chunk)
-                                if any(tool in content_str for tool in ['AcquireVectorData', 'AcquireElevationData', 'AcquireGenericRasterData', 'AcquireBhuvanData', 'PerformBufferAnalysis', 'PerformMultiCriteriaAnalysis', 'PublishFinalMap']):
-                                    step_count += 1
-                                    yield f"data: {json.dumps({'type': 'tool_execution', 'message': f'🛠️ Step {step_count}: Executing geospatial operation...', 'step': step_count, 'timestamp': time.time()})}\n\n"
-                                
-                                yield f"data: {json.dumps({'type': 'thought', 'message': enhanced_chunk, 'timestamp': time.time()})}\n\n"
-                        
-                        else:
-                            content = ""
-                            if hasattr(chunk, 'content'):
-                                content = chunk.content
-                            elif hasattr(chunk, 'text'):
-                                content = chunk.text
-                            else:
-                                content = str(chunk)
-                            
-                            if content and content.strip():
-                                if 'wmsUrl' in content:
-                                    final_result = content
-                                
-                                if any(tool in content for tool in ['AcquireVectorData', 'AcquireElevationData', 'AcquireGenericRasterData', 'AcquireBhuvanData', 'PerformBufferAnalysis', 'PerformMultiCriteriaAnalysis', 'PublishFinalMap']):
-                                    step_count += 1
-                                    yield f"data: {json.dumps({'type': 'tool_start', 'message': f'🛠️ Step {step_count}: Executing geospatial tool...', 'step': step_count, 'timestamp': time.time()})}\n\n"
-                                
-                                message_data = {
-                                    'type': 'message',
-                                    'message': content,
-                                    'timestamp': time.time()
-                                }
-                                yield f"data: {json.dumps(message_data)}\n\n"
-                    
-                    except Exception as e:
-                        print(f"Error processing chunk: {e}")
-                        error_data = {
-                            'type': 'error',
-                            'message': f'Stream processing issue (continuing...): {str(e)}',
-                            'timestamp': time.time()
-                        }
-                        yield f"data: {json.dumps(error_data)}\n\n"
-
-                # Get workflow summary from callback handler
-                workflow_summary = callback_handler.get_summary()
-                
-                # Clean workflow and reasoning logs for JSON serialization
-                clean_workflow_log = []
-                for entry in workflow_summary.get('workflow_log', []):
-                    clean_entry = {}
-                    for key, value in entry.items():
-                        try:
-                            json.dumps(value)
-                            clean_entry[key] = value
-                        except (TypeError, ValueError):
-                            clean_entry[key] = str(value)
-                    clean_workflow_log.append(clean_entry)
-                
-                clean_reasoning_log = []
-                for entry in workflow_summary.get('reasoning_log', []):
-                    clean_entry = {}
-                    for key, value in entry.items():
-                        try:
-                            json.dumps(value)
-                            clean_entry[key] = value
-                        except (TypeError, ValueError):
-                            clean_entry[key] = str(value)
-                    clean_reasoning_log.append(clean_entry)
-                
-                # Send final completion event
-                from django.conf import settings
-                output_dir = settings.MEDIA_ROOT
-                output_files = []
-                if os.path.exists(output_dir):
-                    output_files = [f for f in os.listdir(output_dir) if f.endswith(('.tif', '.geojson'))]
-                
-                completion_data = {
-                    'type': 'complete', 
-                    'message': '🎉 Geospatial analysis complete! Map published to GeoServer.',
-                    'total_steps': step_count,
-                    'output_files': output_files,
-                    'workflow_log': clean_workflow_log,
-                    'reasoning_log': clean_reasoning_log,
-                    'final_map_result': final_result,
-                    'download_ready': True
-                }
-                
-                try:
-                    json.dumps(completion_data)
-                    yield f"data: {json.dumps(completion_data)}\n\n"
-                except (TypeError, ValueError) as e:
-                    fallback_data = {
-                        'type': 'complete',
-                        'message': '🎉 Geospatial analysis complete! Map published to GeoServer.',
-                        'total_steps': step_count,
-                        'output_files': output_files,
-                        'final_map_result': final_result,
-                        'download_ready': True,
-                        'serialization_warning': f'Some data excluded due to serialization issues: {str(e)}'
-                    }
-                    yield f"data: {json.dumps(fallback_data)}\n\n"
-
+                # ... (the main loop is unchanged) ...
             except Exception as e:
-                print(f"Error in event stream generator: {e}")
-                yield f"data: {json.dumps({'type': 'error', 'message': str(e), 'timestamp': time.time()})}\n\n"
-
-        response = StreamingHttpResponse(event_stream_generator(), content_type="text/event-stream")
-        response['Cache-Control'] = 'no-cache'
-        return response
-
-    except Exception as e:
-        print(f"❌ An error occurred: {e}")
-        return JsonResponse({'error': str(e)}, status=500)
-
-@csrf_exempt
-def get_output_files(request):
-    """
-    Returns a list of available output files for download.
-    """
-    try:
-        from django.conf import settings
-        output_dir = settings.MEDIA_ROOT
-        output_files = []
-        if os.path.exists(output_dir):
-            for filename in os.listdir(output_dir):
-                if filename.endswith(('.tif', '.geojson')):
-                    file_path = os.path.join(output_dir, filename)
-                    file_size = os.path.getsize(file_path)
-                    output_files.append({
-                        'name': filename,
-                        'size': file_size,
-                        'type': 'raster' if filename.endswith('.tif') else 'vector'
-                    })
-        
-        return JsonResponse({'files': output_files})
-    except Exception as e:
-        return JsonResponse({'error': str(e)}, status=500)
+                # --- IMPROVED ERROR LOGGING ---
+                error_message = f"❌ Workflow FAILED at Step {step_num} ({tool_name}): {str(e)}"
+                if isinstance(e, FileNotFoundError):
+                    error_message += " This might be due to an issue with a previous step's output."
+                elif isinstance(e, ValueError):
+                    error_message += " This often indicates a data validation issue, like a missing CRS or an empty file."
+                
+                log_entry = {'type': 'error', 'content': error_message}
+                # ... (rest of the error handling is unchanged) ...
+        # ...
 ```
 
-Key improvements made:
-1. Added proper input validation for all tool functions
-2. Enhanced tool descriptions to clearly specify required parameters
-3. Improved error handling in the streaming view
-4. Made the agent prompt more explicit about tool calling requirements
-5. Added better error messages and logging
-6. Ensured proper parameter passing for all tools
+### **4. Frontend (`page.tsx`) - Supporting GeoPackage**
 
-These changes should resolve the tool calling validation issues while maintaining all existing functionality.
+As discussed, this is a very simple but important change.
+
+```tsx
+// In page.tsx, inside the Upload Dialog form
+
+<div className="space-y-2">
+  <Label htmlFor="file">File</Label>
+  {/* --- MODIFY THIS LINE --- */}
+  <Input id="file" name="file" type="file" accept=".zip,.geojson,.tif,.tiff,.gpkg" required />
+  <p className="text-xs text-muted-foreground">
+    Upload GeoJSON, GeoTIFF, GeoPackage, or a ZIP containing a Shapefile.
+  </p>
+</div>
+```
+
+With these comprehensive changes, your application is now significantly more robust. It actively prevents common spatial errors, handles a wider range of user data, and has the intelligence to perform more complex, real-world workflows correctly.

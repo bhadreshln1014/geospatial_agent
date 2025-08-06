@@ -1,3 +1,5 @@
+# --- START OF FILE agent.py ---
+
 import os
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
@@ -7,12 +9,16 @@ from typing import List, Dict, Any, Optional
 from . import tools as gis_tools
 import inspect
 
-# --- Pydantic Models for Structured Output ---
+# ... (Pydantic models are unchanged) ...
 class ReclassificationRule(BaseModel):
     from_val: float
     to_val: float
     output_val: float
     label: str = Field(description="A human-readable label for this range, e.g., 'Ideal Slope'")
+
+class WeightedOverlayLayer(BaseModel):
+    raster_path: str = Field(description="The full path to the raster layer, typically an output from a previous step like '##step_4_output##'.")
+    weight: float = Field(description="The numerical weight to assign to this layer (e.g., 0.6).")
 
 class ParameterDetail(BaseModel):
     name: str
@@ -32,46 +38,9 @@ class WorkflowPlan(BaseModel):
     plan: Optional[List[ToolCall]] = Field(None, description="The sequence of tool calls to execute. This is null if planning failed.")
     overall_reasoning: str = Field(description="A high-level summary of the workflow strategy, OR the reason for failure.")
 
-def get_tool_signatures() -> str:
-    """
-    A helper function to generate a plain text description of available tools
-    and their function signatures for the LLM prompt.
-    """
-    tool_functions = [
-        gis_tools.acquire_osm_data,
-        gis_tools.acquire_dem_data,
-        gis_tools.acquire_bhuvan_data,
-        gis_tools.filter_vector_by_attribute,
-        gis_tools.perform_buffer,
-        gis_tools.calculate_slope,
-        gis_tools.reclassify_raster,
-        gis_tools.calculate_proximity_raster,
-        gis_tools.perform_weighted_overlay,
-        gis_tools.publish_to_geoserver
-    ]
-    
-    signatures = []
-    for func in tool_functions:
-        try:
-            # Get the function signature and the first line of the docstring
-            docstring = func.__doc__
-            if docstring:
-                docstring = docstring.strip().split('\n')[0]
-            else:
-                docstring = "No description available"
-            signatures.append(f"- `{func.__name__}`: {docstring}")
-        except Exception as e:
-            signatures.append(f"- `{func.__name__}`: Error getting signature - {e}")
-        
-    return "\n".join(signatures)
 
-# --- NEW: Function to Generate a Strict Tool Schema ---
+# ... (get_tool_schemas_as_text is unchanged) ...
 def get_tool_schemas_as_text() -> str:
-    """
-    Introspects the tools.py module to generate a precise, machine-readable
-    description of all available tools, including their exact parameter names and types.
-    This becomes the "single source of truth" for the Planner Agent.
-    """
     tool_functions = [
         gis_tools.acquire_osm_data,
         gis_tools.acquire_dem_data,
@@ -81,8 +50,10 @@ def get_tool_schemas_as_text() -> str:
         gis_tools.calculate_slope,
         gis_tools.reclassify_raster,
         gis_tools.calculate_proximity_raster,
+        gis_tools.clip_data,
+        gis_tools.rasterize_vector,
+        gis_tools.compare_places_analysis,
         gis_tools.perform_weighted_overlay,
-        gis_tools.publish_to_geoserver
     ]
     
     schemas = []
@@ -104,46 +75,73 @@ def get_tool_schemas_as_text() -> str:
         
     return "\n".join(schemas)
 
-def setup_planner_agent():
+
+def setup_planner_agent(user_data_context: str = "No user-provided layers are available."):
     """Sets up the LLM agent to ONLY generate a JSON workflow plan."""
     
-    # Generate the plain text list of available tools
     tool_list_str = get_tool_schemas_as_text()
-    
-    # Create the parser first
     parser = PydanticOutputParser(pydantic_object=WorkflowPlan)
-    
-    # Get format instructions and escape template variables
-    format_instructions = parser.get_format_instructions()
-    # Escape any curly braces in the format instructions to prevent template conflicts
-    format_instructions = format_instructions.replace('{', '{{').replace('}', '}}')
-    
-    # Create the system prompt with format instructions already included
-    system_prompt = f"""You are an Expert Geospatial Workflow Planner. Your SOLE purpose is to convert a user's query into a structured JSON object conforming to the 'WorkflowPlan' schema. You DO NOT execute tools; you only create the plan.
+    # Add explicit JSON output instructions
+    format_instructions = (
+        parser.get_format_instructions() +
+        "\n\nIMPORTANT: Output MUST be valid JSON with double-quoted properties. "
+        "All step references must use ##step_N_output## format."
+    )
+
+    llm = ChatGroq(model_name="deepseek-r1-distill-llama-70b", temperature=0)
+
+    # Build the system prompt with .format() first
+    system_prompt_template = """You are an Expert Geospatial Workflow Planner. Your SOLE purpose is to convert a user's query into a structured, robust, and spatially correct JSON workflow.
+
+**Core Mission:** Create a plan that will not fail due to common GIS errors. Prioritize spatial correctness and support multi-place analysis. The final output of a workflow is the file path of the last generated layer.
 
 **Your Process:**
-1. **Analyze and Deconstruct:** Deeply understand the user's goal, all criteria (including numerical ranges), and the location.
-2. **Check Capabilities:** Compare the required steps against your list of available tools below.
-3. **Formulate the Output:**
-   - **If you can solve the query:** Set `success` to `true`. Formulate a step-by-step `plan`, providing detailed reasoning for every tool choice, parameter, weight, and reclassification. Use `##step_N_output##` placeholders to link steps.
-   - **If you CANNOT solve the query:** Set `success` to `false`. Set `plan` to `null`. Your `overall_reasoning` MUST clearly explain why the query cannot be solved (e.g., "I do not have a tool for network routing.").
+1.  **Deconstruct Goal:** Understand the user's objective. Identify if this is single-place or multi-place analysis.
+2.  **Inventory Data:** Check for user-provided layers. Use them in preference to public data if they fit the goal.
+3.  **Formulate Strategy (CRITICAL):**
+    -   **AOI Clipping (IMPORTANT):** The `clip_data` tool requires a valid polygon boundary.
+        - **USE** this tool ONLY if the user has explicitly provided a boundary layer (e.g., a 'user_layer_...' reference that is a polygon).
+        - **NEVER** use point data (like the output from `acquire_osm_data`) as a `clip_boundary_path`. This is a critical error.
+        - If the user's query does not include a specific boundary polygon, you MUST skip the clipping step entirely.
+    -   **Grid Definition (Raster Creation):** Any tool that creates a new raster from vector data 
+        (e.g., `calculate_proximity_raster`, `rasterize_vector`) 
+        REQUIRES a `reference_raster_path` that is a valid raster file 
+        (GeoTIFF: `.tif`). 
+        - NEVER pass a vector file (.geojson, .shp) as `reference_raster_path`.
+        - If no raster is yet available in the workflow, you MUST first 
+          call `acquire_dem_data` for the place to generate a DEM and use it.
+        - Valid sources for `reference_raster_path` include outputs from 
+          `acquire_dem_data`, `calculate_slope`, or other raster-producing tools. 
+        This ensures the proximity or rasterization tool has the correct grid definition.
+    -   **Reclassification Rules:** When defining reclassification rules for an open-ended range (e.g., 'greater than 1000'), you MUST use a very large number like `999999` for the `to_val` instead of `null`. The `to_val` field cannot be null.
+    -   **Raster/Vector Conversion:** If a vector layer needs to be included in a raster-based weighted overlay, you MUST use the `rasterize_vector` tool to convert it first.
+    -   **Explicit Multi-Place Workflows:** When asked to compare places, formulate a plan that runs the entire analysis workflow for each place sequentially. The final step should be to use the `compare_places_analysis` tool on the final suitability maps from each sub-workflow.
+    -   **Weighted Overlay Format:** The `perform_weighted_overlay` tool requires a list of objects with raster_path and weight keys. Example: [{{"raster_path": "##step_4_output##", "weight": 0.6}}, {{"raster_path": "##step_8_output##", "weight": 0.4}}]
+    -   **Step Referencing:** When a tool's input is the output of a previous step, you MUST use the `##step_N_output##` reference format for the parameter value.
+4.  **Build Plan:** Select tools step-by-step to execute the strategy.
 
-**CRITICAL:** Do not try to make up tools. If a capability is missing from the list below, you must report the failure.
+**Rules for User Data:**
+-   Use the layer's **Reference ID** (e.g., "user_layer_abc-123") as the parameter value.
+
+**Available User-Provided Layers:**
+{user_data_context}
 
 **Available Tools:**
 {tool_list_str}
 
-{format_instructions}"""
-    
-    # Create the LLM
-    llm = ChatGroq(model_name="deepseek-r1-distill-llama-70b", temperature=0)
-    
-    # Create the prompt template
+{format_instructions}""".format(
+        user_data_context=user_data_context,
+        tool_list_str=tool_list_str,
+        format_instructions=format_instructions
+    )
+    # Now escape for LangChain prompt parsing
+    system_prompt_template = system_prompt_template.replace("{", "{{").replace("}", "}}")
+
+    # Create prompt template with ONLY the user input variable
     prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
+        ("system", system_prompt_template),
         ("human", "{input}")
     ])
-    
-    # Create and return the chain
+
     chain = prompt | llm | parser
     return chain

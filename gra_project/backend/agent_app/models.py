@@ -1,5 +1,10 @@
 from django.db import models
 import uuid
+import os
+
+def get_upload_path(instance, filename):
+    """Generate upload path: user_uploads/<thread_id>/<filename>"""
+    return os.path.join('user_uploads', str(instance.thread.id), filename)
 
 class AnalysisThread(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -25,3 +30,18 @@ class ThreadMessage(models.Model):
 
     class Meta:
         ordering = ['timestamp']
+
+class UserDataLayer(models.Model):
+    """Model to store user-uploaded spatial data layers."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    thread = models.ForeignKey(AnalysisThread, related_name='user_layers', on_delete=models.CASCADE)
+    name = models.CharField(max_length=255)
+    data_type = models.CharField(max_length=50, choices=[('vector', 'Vector'), ('raster', 'Raster')])
+    file = models.FileField(upload_to=get_upload_path)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.name} ({self.data_type}) - {self.thread.title}"
+
+    class Meta:
+        ordering = ['created_at']

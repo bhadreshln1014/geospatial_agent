@@ -42,15 +42,19 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'corsheaders',
+    
+    # 3rd Party Apps
     'rest_framework',
+    'corsheaders',
+
+    # Local Apps
     'agent_app',
 ]
 
 MIDDLEWARE = [
-    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
+    'corsheaders.middleware.CorsMiddleware', # CORS Middleware
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -134,8 +138,10 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",  # Your Next.js frontend
 ]
-# Or for more permissive local development:
-# CORS_ALLOW_ALL_ORIGINS = True
+# Allow all origins for development purposes.
+# In production, you should restrict this to your frontend's domain.
+CORS_ALLOW_ALL_ORIGINS = True
+
 
 # --- MEDIA FILE CONFIGURATION FOR SERVING GENERATED OUTPUTS ---
 import os
