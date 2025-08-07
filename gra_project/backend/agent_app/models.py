@@ -1,10 +1,16 @@
+# models.py
+
 from django.db import models
 import uuid
 import os
+# --- NEW: Import the secure_filename utility ---
+from werkzeug.utils import secure_filename
 
 def get_upload_path(instance, filename):
     """Generate upload path: user_uploads/<thread_id>/<filename>"""
-    return os.path.join('user_uploads', str(instance.thread.id), filename)
+    # --- NEW: Sanitize the filename to prevent directory traversal attacks ---
+    safe_filename = secure_filename(filename)
+    return os.path.join('user_uploads', str(instance.thread.id), safe_filename)
 
 class AnalysisThread(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
