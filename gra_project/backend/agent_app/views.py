@@ -14,6 +14,8 @@ import rasterio.warp
 from .agent import setup_planner_agent
 from .models import AnalysisThread, ThreadMessage, UserDataLayer
 from . import tools as gis_tools
+from . import geoserver_utils
+from django.http import JsonResponse
 
 # --- LAZY AGENT & TOOL SETUP ---
 _PLANNER_AGENT = None
@@ -155,7 +157,30 @@ class ExecutorView(APIView):
         except ThreadMessage.DoesNotExist:
             return Response({"error": "Message not found"}, status=404)
 
+class ConvertGpkgView(APIView):
+    """Converts a GeoPackage file to a GeoJSON object."""
 
+    def post(self, request, *args, **kwargs):
+        source_file_path = request.data.get('source_path') # e.g., 'user_uploads/some_file.gpkg'
+        if not source_file_path:
+            return Response({"error": "source_path is required"}, status=400)
+
+        full_source_path = os.path.join(settings.MEDIA_ROOT, source_file_path)
+        if not os.path.exists(full_source_path):
+            return Response({"error": "Source file not found"}, status=404)
+
+        try:
+            # Read the GeoPackage file with GeoPandas
+            gdf = gpd.read_file(full_source_path)
+            # Convert the GeoDataFrame to a GeoJSON string, then parse it into a Python dict
+            geojson_data = json.loads(gdf.to_json())
+            
+            # Return the GeoJSON dictionary
+            return JsonResponse(geojson_data)
+
+        except Exception as e:
+            return Response({"error": f"Failed to convert GeoPackage: {str(e)}"}, status=500)
+        
 class ExecutorStreamView(View):
     """Handles Server-Sent Events streaming for execution logs."""
     
@@ -321,60 +346,92 @@ class ExecutorStreamView(View):
             message.final_map_result = {'final_file_path': final_result} if final_result else None
             message.save()
             
-            # --- NEW FINAL MESSAGE BLOCK ---
+            # ###############################################################
+            # ### START: MODIFIED FINAL MESSAGE AND VISUALIZATION BLOCK   ###
+            # ###############################################################
             if final_result and isinstance(final_result, str) and os.path.exists(final_result):
-                # Get the relative path for the URL
-                relative_path = os.path.relpath(final_result, settings.MEDIA_ROOT)
-                file_url = f"/media/{relative_path.replace(os.path.sep, '/')}"  # Ensure forward slashes for URL
-                
-                # Determine file type for the frontend
-                file_type = 'raster' if relative_path.lower().endswith(('.tif', '.tiff')) else 'vector'
-                
-                # Get the bounding box in WGS84 (EPSG:4326) for Leaflet
-                bbox = None
                 try:
-                    if file_type == 'vector':
-                        gdf = gpd.read_file(final_result)
-                        gdf_wgs84 = gdf.to_crs(epsg=4326)
-                        bounds = gdf_wgs84.total_bounds
-                        # Leaflet expects [south, west, north, east]
-                        bbox = [bounds[1], bounds[0], bounds[3], bounds[2]]
-                    else:  # raster
-                        with rasterio.open(final_result) as src:
-                            bounds = src.bounds
-                            # Transform bounds to lat/lon (EPSG:4326)
-                            b = rasterio.warp.transform_bounds(src.crs, 'EPSG:4326', *bounds)
-                            # Leaflet expects [south, west, north, east]
-                            bbox = [b[1], b[0], b[3], b[2]]
-                except Exception as bbox_error:
-                    print(f"Could not calculate BBOX for {final_result}: {bbox_error}")
+                    # --- PATH 1: Handle GeoJSON by sending data directly to the frontend ---
+                    if final_result.lower().endswith('.geojson'):
+                        yield f"data: {json.dumps({'type': 'log', 'content': 'Reading GeoJSON result to send to client...'})}\n\n"
+                        
+                        # Read the GeoJSON file content
+                        with open(final_result, 'r') as f:
+                            geojson_data = json.load(f)
 
-                final_map_data = {
-                    "url": file_url,
-                    "type": file_type,
-                    "bbox": bbox,
-                    "name": os.path.basename(relative_path)
-                }
-                yield f"data: {json.dumps({'type': 'complete', 'content': '🎉 Workflow Finished!', 'map_result': final_map_data})}\n\n"
+                        # Calculate BBOX for Leaflet using GeoPandas
+                        gdf = gpd.read_file(final_result)
+                        b = gdf.to_crs(epsg=4326).total_bounds
+                        bbox = [b[1], b[0], b[3], b[2]] # Format: [south, west, north, east]
+
+                        # Prepare the payload for direct rendering on the client
+                        direct_map_data = {
+                            "type": 'vector',
+                            "data": geojson_data,  # Embed the actual GeoJSON data
+                            "bbox": bbox,
+                            "name": os.path.basename(final_result),
+                            "service_type": "geojson" # Special type to signal the frontend
+                        }
+                        
+                        message.final_map_result = direct_map_data
+                        message.save()
+                        yield f"data: {json.dumps({'type': 'complete', 'content': '🎉 Workflow Finished! GeoJSON data sent to client.', 'map_result': direct_map_data})}\n\n"
+
+                    # --- PATH 2: Handle Rasters and other formats by publishing to GeoServer ---
+                    else:
+                        base_name = os.path.splitext(os.path.basename(final_result))[0]
+                        layer_name = f"{message.thread.id}_{base_name}".replace('-', '_')
+
+                        if final_result.lower().endswith(('.tif', '.tiff')):
+                            file_type = 'raster'
+                            yield f"data: {json.dumps({'type': 'log', 'content': f'Publishing raster layer to GeoServer as `{layer_name}`...'})}\n\n"
+                            qualified_layer_name = geoserver_utils.publish_geotiff(final_result, layer_name)
+                            service_type = 'WMS'
+                        else: # Handle other types like GPKG
+                            file_type = 'vector'
+                            yield f"data: {json.dumps({'type': 'log', 'content': f'Publishing vector layer to GeoServer as `{layer_name}`...'})}\n\n"
+                            qualified_layer_name = geoserver_utils.publish_gpkg(final_result, layer_name)
+                            service_type = 'WMS'
+                        
+                        # Calculate BBOX for Leaflet
+                        bbox = None
+                        if file_type == 'vector':
+                            gdf = gpd.read_file(final_result)
+                            b = gdf.to_crs(epsg=4326).total_bounds
+                            bbox = [b[1], b[0], b[3], b[2]]
+                        else: # raster
+                            with rasterio.open(final_result) as src:
+                                b = rasterio.warp.transform_bounds(src.crs, 'EPSG:4326', *src.bounds)
+                                bbox = [b[1], b[0], b[3], b[2]]
+
+                        geoserver_map_data = {
+                            "service_type": service_type,
+                            "layer_name": qualified_layer_name,
+                            "geoserver_url": settings.GEOSERVER_SETTINGS['URL'],
+                            "bbox": bbox,
+                            "name": os.path.basename(final_result)
+                        }
+                        
+                        message.final_map_result = geoserver_map_data
+                        message.save()
+                        yield f"data: {json.dumps({'type': 'complete', 'content': '🎉 Workflow Finished! Layer published to GeoServer.', 'map_result': geoserver_map_data})}\n\n"
+
+                except Exception as e:
+                    error_message = f"❌ FAILED during final result processing: {str(e)}"
+                    yield f"data: {json.dumps({'type': 'error', 'content': error_message})}\n\n"
+            
+            # Handle case where the final result is a JSON object (e.g., from a statistics tool)
+            elif final_result and isinstance(final_result, dict):
+                message.final_map_result = {'stats_result': final_result}
+                message.save()
+                yield f"data: {json.dumps({'type': 'complete', 'content': '🎉 Workflow Finished!', 'stats_result': final_result})}\n\n"
+            
+            # Handle case where there is no final output
             else:
                 yield f"data: {json.dumps({'type': 'complete', 'content': '🎉 Workflow Finished! No map output was generated.'})}\n\n"
         
         return create_sse_response(event_stream_generator())
 
-
-class ServeMediaView(View):
-    """A view to securely serve files from the MEDIA_ROOT."""
-    def get(self, request, file_path, *args, **kwargs):
-        full_path = os.path.join(settings.MEDIA_ROOT, file_path)
-        
-        # Security check to prevent directory traversal attacks
-        if not os.path.abspath(full_path).startswith(os.path.abspath(settings.MEDIA_ROOT)):
-            raise Http404("Forbidden")
-
-        if os.path.exists(full_path):
-            return FileResponse(open(full_path, 'rb'))
-        else:
-            raise Http404("File not found")
 
 
 class ThreadListView(APIView):

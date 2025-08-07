@@ -14,10 +14,10 @@ import { Switch } from "@/components/ui/switch"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Badge } from "@/components/ui/badge"
-import { Plus, Upload, Play, FileText, Map, Settings, Loader2, CheckCircle, AlertCircle } from "lucide-react"
+import { Plus, Upload, Play, FileText, Map, Settings, Loader2, CheckCircle, AlertCircle, MapPin } from "lucide-react"
 import { useToast } from "@/hooks/use-toast"
 import dynamic from "next/dynamic"
-import { apiService, API_BASE_URL } from "@/lib/api" // NEW IMPORT
+import { apiService, API_BASE_URL } from "@/lib/api"
 
 // Dynamically import Monaco Editor to avoid SSR issues
 const MonacoEditor = dynamic(() => import("@monaco-editor/react"), { ssr: false })
@@ -25,7 +25,11 @@ const MonacoEditor = dynamic(() => import("@monaco-editor/react"), { ssr: false 
 // Dynamically import Map Component to avoid SSR issues
 const MapComponent = dynamic(() => import("@/components/map-component"), { ssr: false })
 
-// --- NEW: API-aligned types ---
+// Dynamically import the new ROI map component
+const RoiMap = dynamic(() => import("@/components/RoiMap"), { ssr: false });
+
+
+// --- API-aligned types ---
 interface Thread {
   id: string
   title: string
@@ -37,7 +41,7 @@ interface ThreadMessage {
     user_query?: string;
     agent_explanation?: string;
     agent_workflow_plan?: AgentWorkflowPlan;
-    execution_log?: any[]; // Can be more specific if you have a type for log entries
+    execution_log?: any[];
     final_map_result?: MapResult;
     timestamp: string;
 }
@@ -47,12 +51,12 @@ interface UserDataLayer {
   id: string
   name: string
   data_type: "Vector" | "Raster"
-  file_path: string // This will be a server path, not directly used by frontend
+  file_path: string
   thread_id: string
 }
 
 interface WorkflowStep {
-  step_id: string // Or step_num from the backend
+  step: number
   tool_name: string
   reasoning: string
   parameters: Record<string, any>
@@ -61,99 +65,19 @@ interface WorkflowStep {
 interface AgentWorkflowPlan {
   overall_reasoning: string
   plan: WorkflowStep[]
-  expected_output: string
 }
 
 interface MapResult {
-  url: string;
+  url?: string | null;      // No longer used for vector, optional for raster
   type: 'vector' | 'raster';
   bbox: [number, number, number, number] | null;
   name: string;
+  data?: any;               // For GeoJSON data
+  service_type?: 'WMS';     // To identify GeoServer layers
+  geoserver_url?: string;
+  layer_name?: string;
 }
 
-// Mock data
-const mockThreads: Thread[] = [
-  {
-    id: "thread_1",
-    title: "Jaipur Solar Farm Siting",
-    created_at: "2024-01-15T10:30:00Z",
-  },
-  {
-    id: "thread_2",
-    title: "Mumbai Flood Risk Analysis",
-    created_at: "2024-01-14T14:20:00Z",
-  },
-  {
-    id: "thread_3",
-    title: "Delhi Air Quality Mapping",
-    created_at: "2024-01-13T09:15:00Z",
-  },
-]
-
-const mockDataLayers: UserDataLayer[] = [
-  {
-    id: "layer_1",
-    name: "Jaipur Elevation",
-    data_type: "Raster",
-    file_path: "/data/jaipur_dem.tif",
-    thread_id: "thread_1",
-  },
-  { id: "layer_2", name: "Road Network", data_type: "Vector", file_path: "/data/roads.geojson", thread_id: "thread_1" },
-  { id: "layer_3", name: "Land Use", data_type: "Vector", file_path: "/data/landuse.shp", thread_id: "thread_1" },
-]
-
-const mockWorkflowPlan: AgentWorkflowPlan = {
-  overall_reasoning:
-    "To find suitable solar farm locations, I'll analyze slope from elevation data, buffer roads for accessibility, reclassify land use for suitable areas, and combine all factors using weighted overlay analysis.",
-  plan: [
-    {
-      step_id: "step_1",
-      tool_name: "calculate_slope",
-      reasoning: "Calculate slope from elevation data to identify areas with suitable gradient for solar installations",
-      parameters: {
-        input_raster: "jaipur_elevation",
-        output_name: "slope_analysis",
-        slope_units: "degrees",
-      },
-    },
-    {
-      step_id: "step_2",
-      tool_name: "perform_buffer",
-      reasoning: "Create buffer zones around roads to ensure accessibility for construction and maintenance",
-      parameters: {
-        input_vector: "road_network",
-        buffer_distance: 1000,
-        output_name: "road_buffers",
-      },
-    },
-    {
-      step_id: "step_3",
-      tool_name: "reclassify_raster",
-      reasoning: "Reclassify slope values to suitability scores (0-5 degrees = suitable)",
-      parameters: {
-        input_raster: "slope_analysis",
-        reclassification: [
-          [0, 5, 1],
-          [5, 15, 0.5],
-          [15, 90, 0],
-        ],
-        output_name: "slope_suitability",
-      },
-    },
-    {
-      step_id: "step_4",
-      tool_name: "weighted_overlay",
-      reasoning: "Combine all suitability factors with appropriate weights to generate final suitability map",
-      parameters: {
-        input_layers: ["slope_suitability", "road_buffers", "landuse_suitable"],
-        weights: [0.4, 0.3, 0.3],
-        output_name: "solar_suitability_final",
-      },
-    },
-  ],
-  expected_output:
-    "A raster map showing solar farm suitability scores from 0-1, with higher values indicating more suitable locations",
-}
 
 export default function GeospatialAnalysisPlatform() {
   const [activeThread, setActiveThread] = useState<Thread | null>(null)
@@ -173,6 +97,8 @@ export default function GeospatialAnalysisPlatform() {
   const [jsonValidationErrors, setJsonValidationErrors] = useState<{ [key: string]: string }>({})
   const [showDataLayers, setShowDataLayers] = useState(false)
   const [activeMessage, setActiveMessage] = useState<ThreadMessage | null>(null);
+  const [roi, setRoi] = useState<any | null>(null);
+  const [roiDialogOpen, setRoiDialogOpen] = useState(false);
 
 
   // Fetch all threads on initial load
@@ -197,7 +123,6 @@ export default function GeospatialAnalysisPlatform() {
     const fetchThreadDetails = async () => {
       if (activeThread) {
         try {
-          // Fetch the last message for the thread to get the latest state
           const messages = await apiService<ThreadMessage[]>(`/threads/${activeThread.id}/messages/`);
           const lastMessage = messages[messages.length - 1];
           
@@ -207,10 +132,8 @@ export default function GeospatialAnalysisPlatform() {
             setWorkflowPlan(lastMessage.agent_workflow_plan || null);
             setExecutionLog(lastMessage.execution_log || []);
             setMapResult(lastMessage.final_map_result || null);
-            // Clear JSON validation errors when switching threads
             setJsonValidationErrors({});
           } else {
-            // Reset fields if there are no messages
             setActiveMessage(null);
             setUserQuery("");
             setWorkflowPlan(null);
@@ -219,7 +142,6 @@ export default function GeospatialAnalysisPlatform() {
             setJsonValidationErrors({});
           }
 
-          // Fetch data layers associated with the thread
           const layers = await apiService<UserDataLayer[]>(`/threads/${activeThread.id}/layers/`);
           setDataLayers(layers);
 
@@ -239,30 +161,43 @@ export default function GeospatialAnalysisPlatform() {
         });
         setThreads([newThread, ...threads]);
         setActiveThread(newThread);
-        // Resetting UI state for the new thread
         setUserQuery("");
         setWorkflowPlan(null);
         setMapResult(null);
         setExecutionLog([]);
         setDataLayers([]);
         setActiveMessage(null);
+        setRoi(null);
     } catch (error) {
         toast({ title: "Error", description: "Failed to create a new analysis thread.", variant: "destructive" });
     }
   }
+
+  const handleRoiSelected = (roiGeoJson: any) => {
+    setRoi(roiGeoJson);
+    setRoiDialogOpen(false);
+    toast({
+      title: "Region of Interest Set",
+      description: `ROI area has been captured successfully.`,
+    });
+  };
 
   const handleGeneratePlan = async () => {
     if (!userQuery.trim() || !activeThread) return
 
     setIsGeneratingPlan(true)
     try {
+      const requestBody = {
+        thread_id: activeThread.id,
+        query: userQuery,
+        roi: roi,
+      };
+
       const planData = await apiService<ThreadMessage>('/plan/', {
         method: 'POST',
-        body: JSON.stringify({
-          thread_id: activeThread.id,
-          query: userQuery,
-        }),
+        body: JSON.stringify(requestBody),
       });
+      
       setWorkflowPlan(planData.agent_workflow_plan || null);
       setActiveMessage(planData);
       toast({
@@ -288,7 +223,7 @@ export default function GeospatialAnalysisPlatform() {
     if (isAdvancedMode && monacoEditorRef.current) {
       try {
         const editorContent = monacoEditorRef.current.getValue()
-        finalPlan = JSON.parse(editorContent); // Parse the full workflow plan
+        finalPlan = JSON.parse(editorContent);
       } catch (error) {
         toast({
           title: "Invalid JSON",
@@ -303,7 +238,6 @@ export default function GeospatialAnalysisPlatform() {
     setExecutionLog([])
 
     try {
-      // First, send the plan data to the backend
       await apiService('/execute/', {
         method: 'POST',
         body: JSON.stringify({
@@ -313,31 +247,32 @@ export default function GeospatialAnalysisPlatform() {
         }),
       });
 
-      // Then open the EventSource for streaming logs
       const eventSource = new EventSource(
         `${API_BASE_URL}/execute/stream/?thread_id=${activeThread.id}&message_id=${activeMessage.id}`
       );
 
-      eventSource.onmessage = (event) => {
-          const data = JSON.parse(event.data);
-          setExecutionLog((prev: any[]) => [...prev, data]);
+      eventSource.onmessage = async (event) => {
+    const data = JSON.parse(event.data);
+    setExecutionLog((prev: any[]) => [...prev, data]);
 
-          // Check for different types of completion messages
-          if (data.type === 'result' || data.type === 'complete') {
-              if (data.map_result) {
-                  setMapResult(data.map_result);
-              }
-              eventSource.close();
-              setIsExecuting(false);
-              toast({
-                  title: "Execution Complete",
-                  description: "Workflow executed successfully. Check the map for results.",
-              });
-          }
-      };
+    // Check for the completion message
+    if (data.type === 'complete') {
+        // If the workflow produced any kind of map result, set it.
+        // The ClientSideMap component will handle the rendering logic.
+        if (data.map_result) {
+            setMapResult(data.map_result);
+        }
+        
+        eventSource.close();
+        setIsExecuting(false);
+        toast({
+            title: "Execution Complete",
+            description: "Workflow finished successfully.",
+        });
+    }
+};
 
       eventSource.onerror = (err) => {
-          console.error("EventSource failed:", err);
           eventSource.close();
           setIsExecuting(false);
           toast({
@@ -347,11 +282,10 @@ export default function GeospatialAnalysisPlatform() {
           });
       };
     } catch (error) {
-      console.error('Execute workflow error:', error);
       setIsExecuting(false);
       toast({
         title: "Execution Error",
-        description: "Failed to start workflow execution. Please try again.",
+        description: "Failed to start workflow execution.",
         variant: "destructive",
       });
     }
@@ -363,19 +297,15 @@ export default function GeospatialAnalysisPlatform() {
         return;
     }
     
-    // Append thread ID to form data
     formData.append('thread_id', activeThread.id);
 
     try {
       const response = await fetch(`${API_BASE_URL}/upload/`, {
         method: 'POST',
         body: formData,
-        // Don't set Content-Type header - let browser set it for multipart/form-data
       });
 
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
 
       const responseData = await response.json();
       
@@ -389,24 +319,20 @@ export default function GeospatialAnalysisPlatform() {
 
       setDataLayers((prev: UserDataLayer[]) => [...prev, newLayer])
       setUploadDialogOpen(false)
-
       toast({
         title: "Upload Successful",
-        description: `${newLayer.name} has been uploaded successfully.`,
+        description: `${newLayer.name} has been uploaded.`,
       })
     } catch (error) {
-      console.error('Upload error:', error);
       toast({
         title: "Upload Failed",
-        description: "Failed to upload file. Please try again.",
+        description: "Failed to upload file.",
         variant: "destructive",
       })
     }
   }
 
   const getStatusIcon = (status: any) => {
-    // Status logic needs to be derived from messages/results
-    // This is a placeholder
     if (mapResult) return <CheckCircle className="h-4 w-4 text-green-500" />
     if (isExecuting) return <Loader2 className="h-4 w-4 text-blue-500 animate-spin" />
     if (workflowPlan) return <FileText className="h-4 w-4 text-yellow-500" />
@@ -416,7 +342,6 @@ export default function GeospatialAnalysisPlatform() {
   const currentThreadLayers = dataLayers.filter((layer) => layer.thread_id === activeThread?.id)
 
   return (
-// ... (The rest of the JSX remains largely the same, only minor changes to props)
     <div className="h-screen w-full flex flex-col">
       {/* Main Content Area */}
       <div className="flex-1 overflow-hidden">
@@ -446,7 +371,6 @@ export default function GeospatialAnalysisPlatform() {
                       >
                         <div className="flex items-center justify-between mb-1">
                           <span className="font-medium text-sm truncate">{thread.title}</span>
-                          {/* The status icon will now be dynamic based on state */}
                           {activeThread?.id === thread.id && getStatusIcon(null)}
                         </div>
                         <p className="text-xs opacity-70">{new Date(thread.created_at).toLocaleDateString()}</p>
@@ -462,36 +386,10 @@ export default function GeospatialAnalysisPlatform() {
 
           {/* Map Viewer Panel (Center) */}
           <ResizablePanel defaultSize={50} minSize={30}>
-            <Card className="h-full rounded-none border-r">
-              <CardHeader>
-                <CardTitle className="text-lg flex items-center">
-                  <Map className="h-5 w-5 mr-2" />
-                  Map Viewer
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="p-0 h-[calc(100%-80px)]">
-                <div className="h-full bg-muted flex items-center justify-center">
-                  {mapResult ? (
-                    <div className="text-center">
-                      <div className="w-full h-64 bg-green-100 rounded mb-4 flex items-center justify-center">
-                        <div className="text-center">
-                          <Map className="h-12 w-12 mx-auto mb-2 text-green-600" />
-                          <p className="font-medium">Analysis Result</p>
-                          <p className="text-sm text-muted-foreground">Layer: {mapResult.name}</p>
-                        </div>
-                      </div>
-                      <Badge variant="outline">Analysis Complete</Badge>
-                    </div>
-                  ) : (
-                    <div className="text-center text-muted-foreground">
-                      <Map className="h-12 w-12 mx-auto mb-4 opacity-50" />
-                      <p>No map results yet</p>
-                      <p className="text-sm">Execute a workflow to see results</p>
-                    </div>
-                  )}
-                </div>
-              </CardContent>
-            </Card>
+            <MapComponent 
+              mapResult={mapResult || undefined} 
+              isVisible={true}
+            />
           </ResizablePanel>
 
           <ResizableHandle />
@@ -525,14 +423,8 @@ export default function GeospatialAnalysisPlatform() {
                               language="json"
                               theme="vs-dark"
                               value={JSON.stringify(workflowPlan, null, 2)}
-                              onMount={(editor) => {
-                                monacoEditorRef.current = editor
-                              }}
-                              options={{
-                                minimap: { enabled: false },
-                                scrollBeyondLastLine: false,
-                                fontSize: 12,
-                              }}
+                              onMount={(editor) => { monacoEditorRef.current = editor }}
+                              options={{ minimap: { enabled: false }, scrollBeyondLastLine: false, fontSize: 12 }}
                             />
                           ) : (
                             <ScrollArea className="h-full">
@@ -565,15 +457,10 @@ export default function GeospatialAnalysisPlatform() {
                                           <div className="space-y-2">
                                             <div className="flex items-center justify-between">
                                               <Label className="text-xs font-medium">Parameters (JSON)</Label>
-                                              {jsonValidationErrors[`step-${index}`] ? (
+                                              {jsonValidationErrors[`step-${index}`] && (
                                                 <div className="flex items-center gap-1">
                                                   <AlertCircle className="h-3 w-3 text-red-500" />
                                                   <span className="text-xs text-red-500">Invalid JSON</span>
-                                                </div>
-                                              ) : (
-                                                <div className="flex items-center gap-1">
-                                                  <CheckCircle className="h-3 w-3 text-green-500" />
-                                                  <span className="text-xs text-green-500">Valid JSON</span>
                                                 </div>
                                               )}
                                             </div>
@@ -583,9 +470,7 @@ export default function GeospatialAnalysisPlatform() {
                                                 language="json"
                                                 theme="vs-dark"
                                                 value={JSON.stringify(step.parameters || {}, null, 2)}
-                                                onMount={(editor) => {
-                                                  stepEditorsRef.current[`step-${index}`] = editor
-                                                }}
+                                                onMount={(editor) => { stepEditorsRef.current[`step-${index}`] = editor }}
                                                 onChange={(value) => {
                                                   const stepKey = `step-${index}`
                                                   try {
@@ -595,29 +480,16 @@ export default function GeospatialAnalysisPlatform() {
                                                       newPlan.plan[index].parameters = parsedParams
                                                       setWorkflowPlan(newPlan)
                                                     }
-                                                    // Clear validation error
                                                     setJsonValidationErrors(prev => {
-                                                      const newErrors = { ...prev }
-                                                      delete newErrors[stepKey]
+                                                      const newErrors = { ...prev };
+                                                      delete newErrors[stepKey];
                                                       return newErrors
                                                     })
                                                   } catch (error) {
-                                                    // Set validation error
-                                                    setJsonValidationErrors(prev => ({
-                                                      ...prev,
-                                                      [stepKey]: (error as Error).message
-                                                    }))
+                                                    setJsonValidationErrors(prev => ({ ...prev, [stepKey]: (error as Error).message }))
                                                   }
                                                 }}
-                                                options={{
-                                                  minimap: { enabled: false },
-                                                  scrollBeyondLastLine: false,
-                                                  fontSize: 12,
-                                                  wordWrap: "on",
-                                                  lineNumbers: "on",
-                                                  folding: true,
-                                                  automaticLayout: true,
-                                                }}
+                                                options={{ minimap: { enabled: false }, scrollBeyondLastLine: false, fontSize: 12, wordWrap: "on" }}
                                               />
                                             </div>
                                           </div>
@@ -637,15 +509,9 @@ export default function GeospatialAnalysisPlatform() {
 
                         <Button onClick={handleExecuteWorkflow} className="w-full" disabled={isExecuting || !workflowPlan || !workflowPlan.plan || workflowPlan.plan.length === 0}>
                           {isExecuting ? (
-                            <>
-                              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                              Executing...
-                            </>
+                            <><Loader2 className="h-4 w-4 mr-2 animate-spin" /> Executing...</>
                           ) : (
-                            <>
-                              <Play className="h-4 w-4 mr-2" />
-                              Execute Workflow
-                            </>
+                            <><Play className="h-4 w-4 mr-2" /> Execute Workflow</>
                           )}
                         </Button>
                       </div>
@@ -685,11 +551,24 @@ export default function GeospatialAnalysisPlatform() {
                   </TabsContent>
 
                   <TabsContent value="map" className="h-[calc(100%-40px)] p-4">
-                    <MapComponent 
-                      mapResult={mapResult || undefined} 
-                      isVisible={!!mapResult}
-                    />
+                    <div className="text-center text-muted-foreground">
+                      <p className="text-sm">Map is displayed in the main viewer panel</p>
+                      {mapResult && (
+                        <div className="mt-4 p-4 bg-muted rounded-lg">
+                          <h4 className="font-medium">Map Details</h4>
+                          <div className="text-sm space-y-1">
+                            <p><span className="font-medium">Name:</span> {mapResult.name}</p>
+                            <p><span className="font-medium">Type:</span> {mapResult.type}</p>
+                            <p><span className="font-medium">URL:</span> {mapResult.url || 'In-memory data'}</p>
+                            {mapResult.bbox && (
+                              <p><span className="font-medium">Bounds:</span> [{mapResult.bbox.join(', ')}]</p>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   </TabsContent>
+
                 </Tabs>
               </CardContent>
             </Card>
@@ -752,9 +631,9 @@ export default function GeospatialAnalysisPlatform() {
                     </div>
                     <div className="space-y-2">
                       <Label htmlFor="file">File</Label>
-                      <Input id="file" name="file" type="file" accept=".zip,.geojson,.tif,.tiff,.shp" required />
+                      <Input id="file" name="file" type="file" accept=".zip,.geojson,.tif,.tiff,.shp,.gpkg" required />
                       <p className="text-xs text-muted-foreground">
-                        Upload GeoJSON, GeoTIFF, or a ZIP containing a Shapefile.
+                        Upload GeoJSON, GeoTIFF, GPKG, or a ZIP containing a Shapefile.
                       </p>
                     </div>
                     <Button type="submit" className="w-full">
@@ -763,27 +642,48 @@ export default function GeospatialAnalysisPlatform() {
                   </form>
                 </DialogContent>
               </Dialog>
+
+              <Dialog open={roiDialogOpen} onOpenChange={setRoiDialogOpen}>
+                <DialogTrigger asChild>
+                  <Button variant="outline" size="icon" title="Select Region of Interest">
+                    <MapPin className={`h-4 w-4 ${roi ? 'text-green-500' : ''}`} />
+                  </Button>
+                </DialogTrigger>
+                <DialogContent className="max-w-4xl">
+                  <DialogHeader>
+                    <DialogTitle>Select Region of Interest</DialogTitle>
+                  </DialogHeader>
+                  <p className="text-sm text-muted-foreground">
+                    Draw a polygon on the map to define your area of analysis.
+                  </p>
+                  <RoiMap onRoiSelected={handleRoiSelected} />
+                </DialogContent>
+              </Dialog>
+
               <Button 
                 onClick={handleGeneratePlan} 
                 disabled={!userQuery.trim() || isGeneratingPlan || !activeThread}
                 className="px-4"
               >
                 {isGeneratingPlan ? (
-                  <>
-                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                    Generating...
-                  </>
+                  <><Loader2 className="h-4 w-4 mr-2 animate-spin" /> Generating...</>
                 ) : (
-                  <>
-                    <Settings className="h-4 w-4 mr-2" />
-                    Generate Plan
-                  </>
+                  <><Settings className="h-4 w-4 mr-2" /> Generate Plan</>
                 )}
               </Button>
             </div>
           </div>
 
-          {/* Data Layers Toggle */}
+          {roi && (
+            <div className="text-xs text-muted-foreground flex items-center gap-2">
+              <CheckCircle className="h-4 w-4 text-green-500" />
+              <span>A custom polygon ROI is active.</span>
+              <Button variant="link" size="sm" className="ml-2 h-auto p-0 text-red-500" onClick={() => setRoi(null)}>
+                Clear
+              </Button>
+            </div>
+          )}
+
           {currentThreadLayers.length > 0 && (
             <div className="flex items-center space-x-2">
               <Button variant="outline" size="sm" onClick={() => setShowDataLayers(!showDataLayers)}>

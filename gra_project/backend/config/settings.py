@@ -147,3 +147,12 @@ CORS_ALLOW_ALL_ORIGINS = True
 import os
 MEDIA_URL = '/output/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'output')
+
+# settings.py
+
+GEOSERVER_SETTINGS = {
+    'URL': 'http://localhost:8080/geoserver',
+    'USER': 'admin',
+    'PASSWORD': 'geoserver',
+    'WORKSPACE': 'geoagent',
+}
