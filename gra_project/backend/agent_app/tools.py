@@ -1,887 +1,493 @@
+# --- START OF FILE tools.py (Definitive Final Version with Environment Isolation) ---
+
 import os
-import geopandas as gpd
-import rasterio
-from rasterio.features import rasterize
-from rasterio.transform import from_bounds
-import numpy as np
-import osmnx as ox
-import pystac_client
-import stackstac
-import rioxarray  # Required for .rio accessor on xarray DataArrays
-import whitebox
+import subprocess
+import json
 import requests
-from django.conf import settings
-import re
-from scipy.ndimage import distance_transform_edt
-from typing import List, Dict
-# --- NEW IMPORTS ---
-import warnings
-from rasterio.mask import mask
+import shutil
+from pydantic import validate_call, FilePath, conlist, PositiveFloat, BaseModel
+from typing import List, Any, Dict
+from .exceptions import ToolValidationError, ToolExecutionError
 import threading
+import re
+import rioxarray
+from django.conf import settings
+import whitebox
+import rasterio
+import numpy as np
 
-# Thread-local storage for workflow context
+# Initialize WhiteboxTools at module level
+wbt = whitebox.WhiteboxTools()
+wbt.verbose = False  # Disable verbose output
+
+def load_dataset_metadata():
+    info_path = os.path.join(settings.BASE_DIR, "PS-4", "info.json")
+    with open(info_path, 'r') as f:
+        return json.load(f)
+
+# --- 1. CRITICAL ENVIRONMENT CONFIGURATION ---
+print("CONFIGURING: Setting environment for public cloud data access.")
+os.environ['AWS_NO_SIGN_REQUEST'] = 'YES'
+os.environ['GDAL_DISABLE_READDIR_ON_OPEN'] = 'EMPTY_DIR'
+
+# --- 2. TOOL REGISTRY SETUP ---
+TOOL_REGISTRY = {}
+def register_tool(func):
+    TOOL_REGISTRY[func.__name__] = func
+    return func
+
+# --- 3. CONTEXT AND HELPER FUNCTIONS ---
 _thread_local = threading.local()
-
 def set_workflow_context(thread_id: str, place_name: str = None):
-    """Set workflow context for current thread to enable proper file naming."""
-    _thread_local.thread_id = thread_id
-    _thread_local.place_name = place_name
+    _thread_local.thread_id, _thread_local.place_name = thread_id, place_name
 
 def get_workflow_context():
-    """Get current workflow context (thread_id, place_name)."""
-    thread_id = getattr(_thread_local, 'thread_id', None)
-    place_name = getattr(_thread_local, 'place_name', None)
-    return thread_id, place_name
-
-def find_layer_by_place_and_type(place_name: str, layer_type: str, output_dir: str) -> str:
-    """
-    Helper function to find layer files for specific place and layer type.
-    Useful for multi-place comparisons.
-    
-    Args:
-        place_name: Place name (e.g., "Chennai", "Mumbai")
-        layer_type: Layer type (e.g., "slope", "proximity", "dem")
-        output_dir: Directory to search in
-    
-    Returns:
-        File path if found, None otherwise
-    """
-    import glob
-    
-    # Sanitize place name for filename matching
-    clean_place = place_name.replace(' ', '_').replace(',', '').replace("'", "").replace('.', '')
-    
-    # Define patterns based on layer type
-    if layer_type.lower() == "slope":
-        patterns = [
-            f"*_{clean_place}_*slope_reclass.tif",
-            f"*_{clean_place}_*slope.tif",
-            f"*{clean_place}*slope_reclass.tif",
-            f"*{clean_place}*slope.tif"
-        ]
-    elif layer_type.lower() == "proximity":
-        patterns = [
-            f"*_{clean_place}_proximity*reclass.tif",
-            f"*_{clean_place}_proximity*.tif",
-            f"*{clean_place}*proximity*reclass.tif",
-            f"*{clean_place}*proximity*.tif"
-        ]
-    elif layer_type.lower() == "dem":
-        patterns = [
-            f"*_{clean_place}_dem.tif",
-            f"*{clean_place}*dem.tif"
-        ]
-    else:
-        # Generic pattern
-        patterns = [
-            f"*_{clean_place}_*{layer_type}*.tif",
-            f"*{clean_place}*{layer_type}*.tif"
-        ]
-    
-    # Try each pattern
-    for pattern in patterns:
-        matches = glob.glob(os.path.join(output_dir, pattern))
-        if matches:
-            # Return most recent file
-            return max(matches, key=os.path.getmtime)
-    
-    return None
-
-def find_layer_by_place_direct(place_name: str, layer_type: str = None) -> str:
-    """
-    Simplified direct layer identification for comparison workflows.
-    Since comparison workflows process places sequentially, we can directly
-    identify layers by place name in the consistent filename structure.
-    
-    Args:
-        place_name: Place name (e.g., "Chennai", "Mumbai", "Delhi")
-        layer_type: Optional layer type filter (e.g., "slope_reclass", "proximity_reclass")
-    
-    Returns:
-        File path if found, None otherwise
-    """
-    import glob
-    
-    output_dir = settings.MEDIA_ROOT
-    
-    # Sanitize place name - handle common variations
-    clean_place = place_name.replace(' ', '_').replace(',', '').replace("'", "").replace('.', '')
-    
-    # For comparison workflows, files follow the pattern: {thread_id}_{place}_{layer_type}.tif
-    if layer_type:
-        # Look for specific layer type
-        if "reclass" not in layer_type.lower():
-            # Try both reclass and original versions
-            patterns = [
-                f"*_{clean_place}_*{layer_type}_reclass.tif",  # Reclassified (preferred)
-                f"*_{clean_place}_*{layer_type}.tif",         # Original
-                f"*{clean_place}*{layer_type}_reclass.tif",   # Alternative format
-                f"*{clean_place}*{layer_type}.tif"            # Alternative format
-            ]
-        else:
-            # Already includes reclass
-            patterns = [
-                f"*_{clean_place}_*{layer_type}.tif",
-                f"*{clean_place}*{layer_type}.tif"
-            ]
-    else:
-        # Return any layer for this place - useful for getting the most recent
-        patterns = [f"*_{clean_place}_*.tif", f"*{clean_place}*.tif"]
-    
-    print(f"TOOL: Direct place lookup for '{place_name}' (layer: {layer_type})")
-    
-    # Try each pattern
-    for pattern in patterns:
-        matches = glob.glob(os.path.join(output_dir, pattern))
-        print(f"TOOL: Pattern '{pattern}' -> {len(matches)} matches")
-        if matches:
-            # Return most recent file
-            found_file = max(matches, key=os.path.getmtime)
-            print(f"TOOL: Found direct match: {os.path.basename(found_file)}")
-            return found_file
-    
-    print(f"TOOL: No direct match found for place '{place_name}'")
-    return None
-
-# Configure AWS for public data access (Copernicus DEM)
-os.environ['AWS_NO_SIGN_REQUEST'] = 'YES'
-# Additional rasterio environment configuration for S3 access
-os.environ['GDAL_DISABLE_READDIR_ON_OPEN'] = 'EMPTY_DIR'
-os.environ['CPL_VSIL_CURL_ALLOWED_EXTENSIONS'] = '.tif,.tiff'
-
-# Initialize WhiteboxTools once
-wbt = whitebox.WhiteboxTools()
-
-# --- Helper Functions ---
-def get_output_filepath(filename: str, thread_id: str = None, place_name: str = None) -> str:
-    """Constructs a full, absolute path in the Django MEDIA_ROOT with optional thread/place prefixing."""
-    output_dir = settings.MEDIA_ROOT
+    from django.conf import settings
+    thread_id = getattr(_thread_local, 'thread_id', 'default_thread')
+    place_name_raw = getattr(_thread_local, 'place_name', 'default_place')
+    place_name = re.sub(r'[^a-zA-Z0-9_-]', '', str(place_name_raw).replace(' ', '_'))
+    output_dir = os.path.join(settings.MEDIA_ROOT, f"{thread_id}_{place_name}")
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Use provided parameters or fall back to thread context
-    if not thread_id or not place_name:
-        context_thread_id, context_place_name = get_workflow_context()
-        thread_id = thread_id or context_thread_id
-        place_name = place_name or context_place_name
-    
-    # If thread_id and place_name are available, prefix the filename for better organization
-    if thread_id and place_name:
-        # Sanitize place name for filename usage
-        clean_place = place_name.replace(' ', '_').replace(',', '').replace("'", "")
-        prefixed_filename = f"{thread_id}_{clean_place}_{filename}"
-        return os.path.join(output_dir, prefixed_filename)
-    
+    return thread_id, place_name, output_dir
+
+def get_output_filepath(filename: str) -> str:
+    _, _, output_dir = get_workflow_context()
     return os.path.join(output_dir, filename)
 
-def get_bbox_from_place(place_name: str):
-    """Geocodes a place name to get its bounding box."""
-    print(f"TOOL: Attempting to geocode '{place_name}'...")
-    gdf = ox.geocode_to_gdf(place_name)
+# --- 4. THE QGIS PROCESS BRIDGE (DEFINITIVE PATH-CLEANING ISOLATION) ---
+def run_qgis_process(algorithm_name: str, params: dict, output_filename_prefix: str) -> str:
+    tool_name = algorithm_name
+    
+    # --- FINAL FIX: Surgically clean the PATH variable ---
+    
+    # Get the path to the virtual environment, if it's active.
+    venv_path = os.environ.get('VIRTUAL_ENV')
+    original_path = os.environ.get('PATH', '')
+    
+    # If a venv is active, filter its 'bin' directory out of the PATH string.
+    # This forces the subprocess to find the system's python, not the venv's.
+    if venv_path and f"{venv_path}/bin" in original_path:
+        path_list = original_path.split(os.pathsep)
+        filtered_paths = [p for p in path_list if not p.startswith(f"{venv_path}/bin")]
+        clean_path = os.pathsep.join(filtered_paths)
+    else:
+        clean_path = original_path
 
-    if gdf.empty:
-        # This provides a clear error if the geocoder returns nothing.
-        raise ValueError(f"Geocoding failed for '{place_name}'. The place was not found.")
-    
-    bounds = gdf.total_bounds
-    print(f"TOOL: Geocoded '{place_name}' to bounding box: {bounds}")
-    return bounds
+    # Create a minimal environment using the cleaned PATH.
+    qgis_env = {
+        'PATH': clean_path,
+        'HOME': os.environ.get('HOME'),
+        'QGIS_PREFIX_PATH': '/usr',
+        'QT_QPA_PLATFORM': 'offscreen',
+    }
 
-def geocode_place(place_name: str):
-    """Geocode a place name to get latitude and longitude."""
-    gdf = ox.geocode_to_gdf(place_name)
-    centroid = gdf.geometry.iloc[0].centroid
-    return centroid.y, centroid.x  # lat, lon
+    # Address the XDG_RUNTIME_DIR warning and permissions issue.
+    runtime_dir = f'/tmp/qgis_runtime_{os.getuid()}'
+    os.makedirs(runtime_dir, mode=0o700, exist_ok=True)
+    qgis_env['XDG_RUNTIME_DIR'] = runtime_dir
+    
+    # Clean out any keys that might have a 'None' value.
+    qgis_env = {k: v for k, v in qgis_env.items() if v is not None}
 
-# --- NEW: SPATIAL VALIDATION & PRE-PROCESSING HELPERS ---
-
-def _validate_and_read_vector(vector_path: str) -> gpd.GeoDataFrame:
-    """Centralized function to validate and read a vector file."""
-    if not os.path.exists(vector_path):
-        raise FileNotFoundError(f"Input file not found at '{vector_path}'.")
+    output_param_candidates = ['OUTPUT', 'OUTPUT_LAYER', 'OUTPUT_RASTER']
+    output_param_name = next((p for p in output_param_candidates if p in params), 'OUTPUT')
     
-    # Check if file is empty
-    if os.path.getsize(vector_path) == 0:
-        raise ValueError(f"Input file '{vector_path}' is empty.")
+    is_raster_output = "raster" in algorithm_name.lower() or output_param_name == 'OUTPUT_RASTER'
+    if not is_raster_output:
+        input_param_name = next((p for p in ['INPUT', 'INPUT_RASTER', 'INPUT_LAYER'] if p in params), None)
+        if input_param_name and isinstance(params.get(input_param_name), str):
+            if params[input_param_name].lower().endswith(('.tif', '.tiff')):
+                is_raster_output = True
     
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            # Add more specific error handling for different file formats
-            gdf = gpd.read_file(vector_path)
-    except Exception as e:
-        # More detailed error information
-        raise ValueError(f"Could not read vector file '{os.path.basename(vector_path)}': {str(e)}. "
-                        f"File size: {os.path.getsize(vector_path)} bytes. "
-                        f"File extension: {os.path.splitext(vector_path)[1]}")
+    ext = ".tif" if is_raster_output else ".gpkg"
+    output_path = get_output_filepath(f"{output_filename_prefix}{ext}")
+    params[output_param_name] = output_path
     
-    if gdf.empty:
-        raise ValueError("The input vector file is empty and contains no features.")
-    
-    # Handle CRS more gracefully
-    if gdf.crs is None:
-        # For GeoJSON files, try to assign a default CRS
-        if vector_path.lower().endswith('.geojson'):
-            print(f"WARNING: GeoJSON file '{os.path.basename(vector_path)}' missing explicit CRS. Assuming EPSG:4326.")
-            gdf.crs = "EPSG:4326"
+    command = ['qgis_process', 'run', algorithm_name, '--']
+    for key, value in params.items():
+        # Check if the value is a list (for multi-input parameters like 'LAYERS')
+        if isinstance(value, list):
+            # If it's a list, iterate and append each item separately
+            for item in value:
+                command.append(f"{key}={item}")
         else:
-            raise ValueError(f"The input vector file '{os.path.basename(vector_path)}' is missing CRS (projection) information.")
+            # If it's not a list, append as a single key=value pair
+            command.append(f"{key}={value}")
     
-    # 🔑 Fix multipart geometry bug
-    gdf["geometry"] = gdf["geometry"].buffer(0)  # repair invalids
-    gdf = gdf.explode(index_parts=False, ignore_index=True)  # split multiparts
-    
-    print(f"TOOL: Successfully read vector file with {len(gdf)} features, CRS: {gdf.crs}")
-    return gdf
-
-
-def _validate_and_read_raster(raster_path: str):
-    """Centralized function to validate and read a raster file."""
-    if not os.path.exists(raster_path):
-        raise FileNotFoundError(f"Input file not found at '{raster_path}'.")
-    
-    # Return rasterio.open for use in with statements
-    return rasterio.open(raster_path)
-
-def _reproject_gdf_to_match(source_gdf: gpd.GeoDataFrame, target_crs_source_path: str) -> gpd.GeoDataFrame:
-    """Helper to reproject a GeoDataFrame to match a target file's CRS."""
-    with _validate_and_read_raster(target_crs_source_path) if target_crs_source_path.endswith(('.tif', '.tiff')) else warnings.catch_warnings():
-        target_gdf = gpd.read_file(target_crs_source_path) if target_crs_source_path.endswith(('.shp', '.geojson', '.gpkg')) else None
-        target_crs = rasterio.open(target_crs_source_path).crs if target_gdf is None else target_gdf.crs
-
-    if source_gdf.crs != target_crs:
-        print(f"CRS MISMATCH: Reprojecting source data to target CRS {target_crs.to_string()}.")
-        return source_gdf.to_crs(target_crs)
-    return source_gdf
-
-# --- 1. DATA ACQUISITION TOOLS ---
-
-def acquire_osm_data(place_name: str, tags: dict) -> str:
-    """Acquires vector data from OpenStreetMap. Returns absolute filepath."""
-    print(f"TOOL: Acquiring OSM data for '{place_name}' with tags: {tags}")
     try:
-        gdf = ox.features_from_place(place_name, tags)
-        if gdf.empty:
-            return f"Error: No features found for tags {tags} in {place_name}."
-        
-        feature_name = list(tags.values())[0] if tags else 'features'
-        filename = f"osm_{feature_name}.geojson"
-        filepath = get_output_filepath(filename)  # Will use thread context automatically
-        gdf.to_file(filepath, driver='GeoJSON')
-        return filepath
-    except Exception as e:
-        return f"Error during OSM data acquisition: {e}"
-
-def acquire_dem_data(place_name: str) -> str:
-    """Acquire a DEM raster for the given place name using Copernicus DEM."""
-
-    try:
-        # Geocode place to bounding box
-        print(f"TOOL: Attempting to geocode '{place_name}'...")
-        bounds = list(get_bbox_from_place(place_name))
-        print(f"TOOL: Geocoded '{place_name}' to bounding box: {bounds}")
-
-        # Buffer if too small
-        min_deg = 0.1  # ~10 km buffer in degrees
-        if (bounds[2] - bounds[0]) < min_deg:
-            bounds[0] -= min_deg / 2
-            bounds[2] += min_deg / 2
-        if (bounds[3] - bounds[1]) < min_deg:
-            bounds[1] -= min_deg / 2
-            bounds[3] += min_deg / 2
-        print(f"TOOL: Expanded bounding box (if needed): {bounds}")
-
-        # Query Copernicus DEM
-        catalog = pystac_client.Client.open("https://earth-search.aws.element84.com/v1")
-        search = catalog.search(collections=["cop-dem-glo-30"], bbox=bounds)
-        items = list(search.items())
-        if not items:
-            return f"Error: No DEM data found for {place_name}."
-
-        stack = stackstac.stack(
-            items,
-            assets=["data"],
-            bounds_latlon=bounds,
-            resolution=30,
-            epsg=4326
+        print(f"Executing QGIS Command: {' '.join(command)}")
+        print(f"Using DEFINITIVELY CLEANED environment with PATH: {qgis_env.get('PATH')}")
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            env=qgis_env
         )
-        dem = stack.mean(dim="time").compute()
-        print(f"TOOL: Created DEM raster with final shape: {dem.shape}")
+        print(f"QGIS STDOUT: {result.stdout}")
+        
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+             raise ToolExecutionError(f"QGIS ran but produced an empty/missing output file. Check logs. STDOUT: {result.stdout}", tool_name)
+        return output_path
+    except FileNotFoundError:
+        raise ToolExecutionError("The 'qgis_process' command was not found. Is QGIS installed and in your PATH?", tool_name)
+    except subprocess.CalledProcessError as e:
+        raise ToolExecutionError(f"QGIS algorithm '{algorithm_name}' failed. Error: {e.stderr}", tool_name)
 
-        # Guard against tiny DEMs
-        if dem.shape[1] < 50 or dem.shape[2] < 50:
-            print(f"WARNING: DEM for {place_name} is very small ({dem.shape}). Consider expanding bounds further.")
+@register_tool
+@validate_call
+def acquire_data_from_url(url: str, file_name: str) -> FilePath:
+    """
+    Downloads a file from a URL. This is the fallback for data acquisition.
+
+    When to Use:
+    - This tool should ONLY be used when a required dataset (e.g., a specific
+      district boundary, a different DEM) is NOT available in the local PS4
+      data library (as described in info.json).
+    - If a user asks for analysis on a specific area like a district, but no
+      boundary file for that district is in the available datasets, you MUST
+      use this tool to attempt to download it.
+
+    Important Note:
+    - If a user does not provide a URL, you should construct a plausible
+      placeholder URL from a known public data source and state in your
+      reasoning that the user needs to verify it.
+    """
+    output_path = get_output_filepath(file_name)
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        with open(output_path, 'wb') as f:
+            shutil.copyfileobj(r.raw, f)
+    return output_path
+
+@register_tool
+@validate_call
+def reclassify_raster(raster_path: FilePath, reclass_values: List[List[Any]]) -> FilePath:
+    """
+    Changes raster pixel values based on a table of rules. Analogy: Sorting pixels into new bins.
+
+    When to Use:
+    - **Suitability Modeling (Creating Binary Rasters):** To convert a continuous raster
+      (like slope from 0-90 degrees) into a binary one where 1 means 'Suitable' and
+      0 means 'Unsuitable'. For example, if suitable slope is < 15 degrees, you
+      would reclassify values from 0-15 to 1, and 15-90 to 0.
+    - **Normalization for Weighted Overlay:** To convert several input rasters with
+      different value ranges (e.g., elevation, rainfall) to a common, consistent
+      scale (e.g., 1 to 10) before using the `perform_weighted_overlay` tool.
+
+    Important Note:
+    - The `reclass_values` parameter MUST be a list of lists. Each inner list must
+      contain exactly three numbers: `[minimum_value, maximum_value, new_output_value]`.
+    """
+    qgis_table_list = [item for sublist in reclass_values for item in sublist]
+    
+    # 2. Convert the list of numbers into a single, comma-separated string.
+    #    This is the format that the qgis_process command-line tool expects.
+    #    Example: [0, 5, 10] becomes "0,5,10"
+    qgis_table_str = ','.join(map(str, qgis_table_list))
+
+    # 3. Build the parameters dictionary using the correctly formatted string.
+    params = {
+        'INPUT_RASTER': str(raster_path),
+        'RASTER_BAND': 1,
+        'TABLE': qgis_table_str, # <-- Pass the string, not the list
+        'NO_DATA': -9999.0,
+        'RANGE_BOUNDARIES': 0,
+        'USE_NODATA': False,
+        'DATA_TYPE': 5,
+        'OUTPUT': ''
+    }
+
+    input_basename = os.path.splitext(os.path.basename(str(raster_path)))[0]
+    output_prefix = f'reclassified_{input_basename}'
+    
+    return run_qgis_process('native:reclassifybytable', params, output_prefix)
+
+@register_tool
+@validate_call
+def perform_buffer(vector_path: FilePath, distance_meters: PositiveFloat) -> FilePath:
+    """
+    Creates a buffer zone around vector features. Analogy: Drawing a 'halo' or 'zone of influence'.
+
+    When to Use:
+    - **Proximity Analysis:** Answering questions like "Find all areas within 500 meters of a river"
+      or "Identify properties within 1km of a proposed highway."
+    - **Defining Influence or Exclusion Zones:** Creating a protection zone around a sensitive
+      feature or an influence area around a commercial location.
+
+    Important Note:
+    - The buffer `distance_meters` is specified in meters.
+    - This tool automatically dissolves overlapping buffers into a single polygon feature.
+    """
+    params = {'INPUT': str(vector_path), 'DISTANCE': float(distance_meters), 'SEGMENTS': 8, 'DISSOLVE': True, 'OUTPUT': ''}
+    return run_qgis_process('native:buffer', params, f'buffer_{distance_meters}m')
+
+@register_tool
+@validate_call
+def clip_data(data_to_clip_path: FilePath, clip_boundary_path: FilePath) -> FilePath:
+    """
+    Spatially cuts a dataset using another's boundary. Analogy: A 'cookie cutter'.
+
+    When to Use:
+    - **Scoping Analysis (Most Common Use):** To limit a large, statewide dataset (like
+      `Assam_LULC`) to a smaller, specific area of interest (like a district boundary
+      that you downloaded).
+    - **Intersection for Damage Assessment:** To find the geographic overlap between an
+      asset layer (e.g., buildings, LULC) and a hazard layer (e.g., flood boundary).
+
+    Important Note:
+    - This tool is smart: it automatically detects if the `data_to_clip_path` is a
+      raster or a vector and uses the correct underlying QGIS algorithm.
+    - The `clip_boundary_path` must always be a vector layer.
+    """
+    if str(data_to_clip_path).lower().endswith(('.tif', '.tiff')):
+        params = {'INPUT': str(data_to_clip_path), 'MASK': str(clip_boundary_path), 'OUTPUT': ''}
+        return run_qgis_process('gdal:cliprasterbymasklayer', params, 'clipped_raster')
+    else:
+        params = {'INPUT': str(data_to_clip_path), 'OVERLAY': str(clip_boundary_path), 'OUTPUT': ''}
+        return run_qgis_process('native:clip', params, 'clipped_vector')
+
+@register_tool
+@validate_call
+def multiply_rasters(**kwargs: FilePath) -> FilePath:
+    """
+    Multiplies pixel values of rasters together. This is for Boolean 'AND' logic.
+
+    When to Use:
+    - This is the primary tool to combine criteria in a **Boolean Suitability Analysis**.
+    - It should be used *after* you have created several binary (0/1) suitability maps
+      using the `reclassify_raster` tool. The output will be 1 only in pixels
+      where *all* input rasters were also 1, finding areas that meet every condition.
+
+    Important Note:
+    - This tool treats all inputs equally. If you need to assign different levels
+      of importance, you MUST use `perform_weighted_overlay` instead.
+    """
+    rasters = list(kwargs.values())
+    expr = ' * '.join([f'"{chr(ord("a") + i)}@1"' for i in range(len(rasters))])
+    params = {'EXPRESSION': expr, 'LAYERS': [str(p) for p in rasters], 'OUTPUT': ''}
+    return run_qgis_process('qgis:rastercalculator', params, 'multiplied_rasters')
+
+class WeightedOverlayInput(BaseModel):
+    raster_path: FilePath
+    weight: float
+
+@register_tool
+@validate_call
+def perform_weighted_overlay(layer_weights: List[WeightedOverlayInput]) -> str:
+    """
+    Robust weighted overlay with dimension checking and resampling.
+    """
+    # Input validation
+    if not layer_weights:
+        raise ToolValidationError("At least one input layer required", "perform_weighted_overlay")
+
+    total_weight = sum(item.weight for item in layer_weights)
+    if not 0.99 <= total_weight <= 1.01:
+        raise ToolValidationError(f"Weights must sum to 1.0 (got {total_weight})", 
+                               "perform_weighted_overlay")
+
+    output_path = get_output_filepath("weighted_overlay.tif")
+
+    try:
+        # First check all rasters have same dimensions
+        with rasterio.open(layer_weights[0].raster_path) as src:
+            base_shape = src.shape
+            base_transform = src.transform
+            base_crs = src.crs
+            meta = src.meta.copy()
+
+        # Resample any mismatched rasters
+        resampled_paths = []
+        for i, item in enumerate(layer_weights):
+            with rasterio.open(item.raster_path) as src:
+                if src.shape != base_shape or src.transform != base_transform:
+                    resampled_path = get_output_filepath(f"resampled_{i}.tif")
+                    resampled_paths.append(resampled_path)
+                    
+                    wbt.resample(
+                        inputs=item.raster_path,
+                        output=resampled_path,
+                        cell_size=base_transform[0],  # Use base raster's resolution
+                        base=layer_weights[0].raster_path  # Match to first raster
+                    )
+                    item.raster_path = resampled_path
+
+        # Perform weighted sum
+        result = np.zeros(base_shape, dtype=np.float32)
+        for item in layer_weights:
+            with rasterio.open(item.raster_path) as src:
+                data = src.read(1)
+                data[data == src.nodata] = 0  # Handle nodata
+                result += data.astype(np.float32) * item.weight
 
         # Write output
-        filepath = get_output_filepath("dem.tif")
-        dem.rio.write_crs("EPSG:4326", inplace=True)
-        dem.rio.to_raster(filepath)
-        return filepath
+        meta.update(dtype=rasterio.float32)
+        with rasterio.open(output_path, 'w', **meta) as dst:
+            dst.write(result, 1)
+
+        # Cleanup temporary files
+        for path in resampled_paths:
+            if os.path.exists(path):
+                os.remove(path)
+
+        return output_path
 
     except Exception as e:
-        return f"Error in acquire_dem_data: {e}"
+        raise ToolExecutionError(
+            f"Weighted overlay failed: {str(e)}", 
+            "perform_weighted_overlay"
+        )
 
-
-def acquire_bhuvan_data(place_name: str, layer_name: str) -> str:
-    """Acquires vector data from ISRO's Bhuvan WFS service. Returns absolute filepath."""
-    print(f"TOOL: Acquiring Bhuvan layer '{layer_name}' for '{place_name}'")
-    try:
-        bounds = get_bbox_from_place(place_name)
-        wfs_url = "https://bhuvan-app1.nrsc.gov.in/geoserver/wfs"
-        params = {'service': 'WFS', 'version': '1.0.0', 'request': 'GetFeature', 'typeName': layer_name, 'outputFormat': 'application/json', 'bbox': f"{bounds[0]},{bounds[1]},{bounds[2]},{bounds[3]},EPSG:4326"}
-        gdf = gpd.read_file(wfs_url, params=params)
-        if gdf.empty:
-            return f"Error: No Bhuvan data found for layer {layer_name}."
-        
-        filename = f"bhuvan_{layer_name.replace(':', '_')}.geojson"
-        filepath = get_output_filepath(filename)
-        gdf.to_file(filepath, driver='GeoJSON')
-        return filepath
-    except Exception as e:
-        return f"Error during Bhuvan data acquisition: {e}"
-
-# --- 2. VECTOR ANALYSIS TOOLS ---
-
-def filter_vector_by_attribute(vector_path: str, expression: str) -> str:
-    """Filters a vector file based on an attribute query. E.g., 'area_sqkm > 5'. Returns new filepath."""
-    try:
-        gdf = _validate_and_read_vector(vector_path)
-        
-        print(f"TOOL: Original filter expression: {expression}")
-        print(f"Available columns: {list(gdf.columns)}")
-        
-        # Check if the expression is trying to filter by a boolean condition
-        # Handle common issues with pandas queries
-        if "==" in expression or "!=" in expression or ">" in expression or "<" in expression:
-            # This looks like a proper comparison expression
-            fixed_expression = expression.replace(" = ", " == ")
-            fixed_expression = fixed_expression.replace("'", '"')
-        else:
-            # Handle cases where expression might be just a column name or boolean value
-            # Try to interpret as a boolean column filter
-            if expression.lower() in ['true', 'false']:
-                return f"Error: Boolean literal '{expression}' cannot be used directly. Please specify a column condition like 'column_name == True'."
-            
-            # Check if it's a column name that contains boolean values
-            if expression in gdf.columns:
-                # If it's a boolean column, filter for True values
-                if gdf[expression].dtype == 'bool':
-                    fixed_expression = f"{expression} == True"
-                else:
-                    return f"Error: Column '{expression}' is not boolean. Please specify a condition like '{expression} > 0'."
-            else:
-                # Try the original expression but with standard fixes
-                fixed_expression = expression.replace(" = ", " == ")
-                fixed_expression = fixed_expression.replace("'", '"')
-        
-        print(f"TOOL: Applying filter expression: {fixed_expression}")
-        
-        try:
-            filtered_gdf = gdf.query(fixed_expression)
-        except Exception as query_error:
-            # If query fails, try alternative approaches
-            print(f"Query failed: {query_error}. Trying alternative filtering...")
-            
-            # Try to parse simple conditions manually
-            if " == " in fixed_expression:
-                parts = fixed_expression.split(" == ")
-                if len(parts) == 2:
-                    col_name = parts[0].strip().strip('"').strip("'")  # Remove quotes from column name
-                    value = parts[1].strip().strip('"').strip("'")     # Remove quotes from value
-                    
-                    print(f"Parsed: column='{col_name}', value='{value}'")
-                    
-                    if col_name in gdf.columns:
-                        # Check for null/None values in the column to avoid comparison issues
-                        if gdf[col_name].isna().all():
-                            return f"Warning: Column '{col_name}' contains only null values. Cannot filter."
-                        
-                        # Filter out null values first
-                        valid_data = gdf[gdf[col_name].notna()]
-                        
-                        if value.lower() == 'true':
-                            filtered_gdf = valid_data[valid_data[col_name] == True]
-                        elif value.lower() == 'false':
-                            filtered_gdf = valid_data[valid_data[col_name] == False]
-                        elif value.lower() == 'null' or value.lower() == 'none':
-                            filtered_gdf = gdf[gdf[col_name].isna()]
-                        else:
-                            # Try to convert value to appropriate type
-                            try:
-                                if value.replace('.', '').replace('-', '').isdigit():
-                                    value = float(value) if '.' in value else int(value)
-                                filtered_gdf = valid_data[valid_data[col_name] == value]
-                            except:
-                                # String comparison
-                                filtered_gdf = valid_data[valid_data[col_name] == value]
-                    else:
-                        available_cols = [col for col in gdf.columns if col.lower() == col_name.lower()]
-                        if available_cols:
-                            suggestion = available_cols[0]
-                            return f"Error: Column '{col_name}' not found. Did you mean '{suggestion}'? Available columns: {list(gdf.columns)}"
-                        else:
-                            return f"Error: Column '{col_name}' not found in the data. Available columns: {list(gdf.columns)}"
-                else:
-                    raise query_error
-            else:
-                raise query_error
-        
-        if filtered_gdf.empty:
-            return f"Warning: No features remained after applying filter '{fixed_expression}'. The result is an empty layer."
-        
-        filepath = vector_path.replace('.geojson', '_filtered.geojson').replace('.shp', '_filtered.shp')
-        filtered_gdf.to_file(filepath)
-        print(f"TOOL: Filtered {len(gdf)} features down to {len(filtered_gdf)} features.")
-        return filepath
-    except Exception as e:
-        return f"Error during vector filtering: {e}"
-
-def perform_buffer(vector_filepath: str, distance_meters: float) -> str:
-    """Creates a buffer zone around vector features. Returns new absolute filepath."""
-    try:
-        gdf = _validate_and_read_vector(vector_filepath)
-        # Estimate UTM CRS for accurate meter-based buffering
-        utm_crs = gdf.estimate_utm_crs()
-        if utm_crs is None:
-            return "Error: Could not determine a suitable UTM projection for buffering. The data may be in an unusual location."
-        
-        gdf_proj = gdf.to_crs(utm_crs)
-        gdf_proj['geometry'] = gdf_proj.buffer(distance_meters)
-        gdf_buffered = gdf_proj.to_crs(gdf.crs)
-        
-        filepath = vector_filepath.replace(".geojson", f"_buffer_{distance_meters}m.geojson").replace(".shp", f"_buffer_{distance_meters}m.shp")
-        gdf_buffered.to_file(filepath)
-        return filepath
-    except Exception as e:
-        return f"Error during buffer analysis: {e}"
-
-# --- 3. RASTER ANALYSIS TOOLS ---
-
-def calculate_slope(dem_path: str) -> str:
-    """Calculates slope from a DEM using WhiteboxTools. Returns filepath of slope raster."""
-    try:
-        # Validate and potentially fix CRS issues
-        with rasterio.open(dem_path) as src:
-            if src.crs is None:
-                print(f"WARNING: DEM file '{os.path.basename(dem_path)}' missing CRS. Attempting to fix by setting EPSG:4326...")
-                # Create a temporary file with CRS properly set
-                temp_dem_path = dem_path.replace('.tif', '_with_crs.tif')
-                
-                # Read the data and set CRS
-                with rasterio.open(dem_path) as src_no_crs:
-                    data = src_no_crs.read()
-                    profile = src_no_crs.profile.copy()
-                    profile.update(crs='EPSG:4326')
-                
-                # Write with CRS
-                with rasterio.open(temp_dem_path, 'w', **profile) as dst:
-                    dst.write(data)
-                
-                # Use the temporary file for slope calculation
-                dem_path = temp_dem_path
-        
-        _validate_and_read_raster(dem_path) # Just validates the raster
-        filepath = dem_path.replace('.tif', '_slope.tif')
-        wbt.slope(dem=dem_path, output=filepath)
-        return filepath
-    except Exception as e:
-        return f"Error during slope calculation: {e}"
-
-def reclassify_raster(raster_path: str, reclass_values: list) -> str:
-    """Reclassifies a raster based on a list of ranges. E.g., [[0, 10, 1], [10, 20, 0]]. Returns new filepath."""
-    try:
-        _validate_and_read_raster(raster_path)
-        filepath = raster_path.replace('.tif', '_reclass.tif')
-        # WhiteboxTools reclass format: "new_value;start;end"
-        reclass_items = []
-        for row in reclass_values:
-            if len(row) >= 3:
-                low, high, new = row[0], row[1], row[2]
-                reclass_items.append(f"{new};{low};{high}")
-        
-        if not reclass_items:
-            return "Error: Reclassification values were provided in an invalid format."
-            
-        reclass_str = ";".join(reclass_items)
-        wbt.reclass(i=raster_path, output=filepath, reclass_vals=reclass_str)
-        return filepath
-    except Exception as e:
-        return f"Error during raster reclassification: {e}"
-
-def calculate_proximity_raster(vector_path: str, reference_raster_path: str) -> str:
-    """Creates a raster showing Euclidean distance to vector features. Returns distance raster filepath."""
-    try:
-        if not os.path.exists(reference_raster_path):
-            return f"Error: Reference raster not found at {reference_raster_path}"
-        if not reference_raster_path.lower().endswith(('.tif', '.tiff')):
-            return f"Error: Reference raster must be a .tif file, got {os.path.basename(reference_raster_path)}"
-        
-        print(f"TOOL: Starting proximity calculation")
-        print(f"TOOL: Vector path: {vector_path}")
-        print(f"TOOL: Reference raster path: {reference_raster_path}")
-        
-        # Validate inputs exist
-        if not os.path.exists(vector_path):
-            return f"Error: Vector file not found: {vector_path}"
-            
-        print(f"TOOL: Vector file size: {os.path.getsize(vector_path)} bytes")
-        
-        # Read vector with improved error handling
-        gdf = _validate_and_read_vector(vector_path)
-        print(f"TOOL: Successfully loaded vector with {len(gdf)} features")
-        
-        with _validate_and_read_raster(reference_raster_path) as ref:
-            meta = ref.meta.copy()
-            print(f"TOOL: Reference raster - Shape: {ref.shape}, CRS: {ref.crs}")
-            
-            # Reproject vector to match reference raster CRS
-            print(f"TOOL: Reprojecting vector from {gdf.crs} to {ref.crs}")
-            gdf_proj = gdf.to_crs(ref.crs)
-            
-            # Create the rasterization mask
-            print(f"TOOL: Creating rasterization mask...")
-            mask = rasterize(
-                shapes=[geom for geom in gdf_proj.geometry], 
-                out_shape=(meta['height'], meta['width']), 
-                transform=meta['transform'], 
-                fill=0, 
-                all_touched=True, 
-                dtype=np.uint8
-            )
-            
-            print(f"TOOL: Calculating proximity...")
-            proximity_data = distance_transform_edt(mask == 0)
-            
-            # Extract feature type from vector filename for better naming
-            vector_basename = os.path.basename(vector_path).split('.')[0]
-            feature_parts = vector_basename.split('_')
-            if len(feature_parts) >= 3:
-                feature_name = '_'.join(feature_parts[2:])  # Skip thread_id and place parts
-            else:
-                feature_name = vector_basename
-            
-            filename = f"proximity_{feature_name}.tif"
-            filepath = get_output_filepath(filename)
-            
-            print(f"TOOL: Writing proximity raster to: {filepath}")
-            meta.update(dtype='float32')
-            
-            with rasterio.open(filepath, 'w', **meta) as dst:
-                dst.write(proximity_data.astype(np.float32), 1)
-            
-            print(f"TOOL: Proximity calculation complete: {filepath}")
-            return filepath
-            
-    except Exception as e:
-        print(f"TOOL: Error in proximity calculation: {str(e)}")
-        return f"Error during proximity calculation: {e}"
-
-
-# --- 4. NEW SPATIAL UTILITY TOOLS ---
-
-def clip_data(data_to_clip_path: str, clip_boundary_path: str) -> str:
-    """Clips a vector or raster file to the extent of a boundary polygon. Returns new filepath."""
-    try:
-        clip_gdf = _validate_and_read_vector(clip_boundary_path)
-        
-        geom_types = clip_gdf.geometry.geom_type.unique()
-        if not any(g_type in ['Polygon', 'MultiPolygon'] for g_type in geom_types):
-            return f"Error: Clipping boundary file must contain Polygon geometries, but found only: {list(geom_types)}"
-
-        if data_to_clip_path.endswith(('.geojson', '.shp', '.gpkg')):
-            data_gdf = _validate_and_read_vector(data_to_clip_path)
-            # Reproject data to match clipping boundary's CRS
-            data_gdf_proj = data_gdf.to_crs(clip_gdf.crs)
-            clipped_gdf = gpd.clip(data_gdf_proj, clip_gdf)
-            
-            if clipped_gdf.empty:
-                return "Warning: The clip operation resulted in an empty layer. The layers may not overlap."
-
-            filepath = data_to_clip_path.replace('.', '_clipped.')
-            clipped_gdf.to_file(filepath)
-            return filepath
-        
-        elif data_to_clip_path.endswith(('.tif', '.tiff')):
-            with _validate_and_read_raster(data_to_clip_path) as src:
-                # Reproject clipping boundary to match raster's CRS
-                clip_gdf_proj = clip_gdf.to_crs(src.crs)
-                out_image, out_transform = mask(src, clip_gdf_proj.geometry, crop=True)
-                out_meta = src.meta.copy()
-            
-            out_meta.update({"driver": "GTiff", "height": out_image.shape[1], "width": out_image.shape[2], "transform": out_transform})
-            filepath = data_to_clip_path.replace('.', '_clipped.')
-            with rasterio.open(filepath, "w", **out_meta) as dest:
-                dest.write(out_image)
-            return filepath
-        else:
-            return f"Error: Unsupported file type for clipping: {os.path.basename(data_to_clip_path)}"
-    except Exception as e:
-        return f"Error during clipping: {e}"
-
-def rasterize_vector(vector_path: str, reference_raster_path: str, burn_value: float = 1) -> str:
-    """Converts a vector file into a raster grid matching a reference raster. Returns new filepath."""
-    try:
-        if not os.path.exists(reference_raster_path):
-            return f"Error: Reference raster not found at {reference_raster_path}"
-        if not reference_raster_path.lower().endswith(('.tif', '.tiff')):
-            return f"Error: Reference raster must be a .tif file, got {os.path.basename(reference_raster_path)}"
-
-        gdf = _validate_and_read_vector(vector_path)
-        with _validate_and_read_raster(reference_raster_path) as ref:
-            meta = ref.meta.copy()
-            gdf_proj = gdf.to_crs(ref.crs)
-
-        shapes = ((geom, burn_value) for geom in gdf_proj.geometry)
-        filepath = get_output_filepath(f"rasterized_{os.path.basename(vector_path).split('.')[0]}.tif")
-        
-        with rasterio.open(filepath, 'w+', **meta) as out:
-            out_arr = out.read(1)
-            rasterized_arr = rasterize(shapes=shapes, fill=0, out=out_arr, transform=out.transform)
-            out.write(rasterized_arr, 1)
-        return filepath
-    except Exception as e:
-        return f"Error during rasterization: {e}"
-
-# --- 5. SYNTHESIS & PUBLISHING TOOLS ---
-
-def perform_weighted_overlay(layer_weights: List[Dict]) -> str:
+@register_tool
+@validate_call
+def calculate_vector_area(vector_path: FilePath) -> Dict[str, Any]:
     """
-    Performs a weighted sum of multiple rasters. The input MUST be a list of objects, 
-    each specifying a raster_path and its numerical weight.
-    Example: list of dicts with raster_path and weight keys
-    
-    Args:
-        layer_weights: List of dictionaries with raster_path and weight keys
-    
-    Returns:
-        Path to the final weighted overlay raster
+    Calculates summary statistics (like area) for a vector layer. Does NOT produce a map.
+
+    When to Use:
+    - This should be the **FINAL step** of any workflow that answers a question like
+      **"How much...?"** or asks for a number instead of a map.
+    - Example: After clipping agricultural land to a flood boundary, use this tool on the
+      result to calculate the total affected area in square meters.
+
+    Important Note:
+    - The output of this tool is a JSON object containing statistics, not a new map file.
+      It is a terminal step for a quantitative analysis.
     """
+    params = {'INPUT_LAYER': str(vector_path)}
+    command = ['qgis_process', 'run', 'native:vectorlayerstatistics', '--json', json.dumps(params)]
+    result = subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8')
+    return json.loads(result.stdout)
+
+@register_tool
+def get_data_from_ps4(data_name: str) -> str: # <--- RENAMED from 'dataset_name' to 'data_name'
+    """
+    Retrieves a dataset from the local data library using its specified `name`.
+
+    When to Use:
+    - This should **ALWAYS be your first choice** for getting data. Before trying to
+      download anything with `acquire_data_from_url`, you MUST check if a suitable
+      dataset is already available by inspecting the 'Available Datasets' list.
+
+    Important Note:
+    - The `data_name` parameter must exactly match the `name` attribute of a dataset
+      listed in the `info.json` file.
+    - If a dataset with the specified name is not found, this tool will fail. Your
+      plan should anticipate this and use `acquire_data_from_url` as a fallback.
+    """
+    from django.conf import settings
+    
+    # 1. Load the metadata manifest
     try:
-        if not layer_weights:
-            return "Error: Input 'layer_weights' list cannot be empty for weighted overlay."
-
-        print(f"TOOL: Performing weighted overlay with {len(layer_weights)} layers")
-        
-        # Validate and process each layer
-        validated_layers = []
-        for i, layer in enumerate(layer_weights):
-            if not isinstance(layer, dict):
-                return f"Error: Layer {i+1} must be a dictionary with raster_path and weight keys."
-            
-            if 'raster_path' not in layer:
-                return f"Error: Layer {i+1} missing required raster_path key."
-            if 'weight' not in layer:
-                return f"Error: Layer {i+1} missing required weight key."
-            
-            raster_path = layer['raster_path']
-            weight = layer['weight']
-            
-            # Validate weight is numeric
-            try:
-                weight = float(weight)
-                if weight < 0:
-                    return f"Error: Weight for layer {i+1} must be non-negative, got {weight}"
-            except (ValueError, TypeError):
-                return f"Error: Weight for layer {i+1} must be a number, got '{weight}' ({type(weight)})"
-            
-            # Validate raster path exists
-            if not os.path.exists(raster_path):
-                return f"Error: Raster file not found: {raster_path}"
-            
-            validated_layers.append({'raster_path': raster_path, 'weight': weight})
-            print(f"TOOL: Layer {i+1}: {os.path.basename(raster_path)} (weight: {weight})")
-
-        # Read base raster metadata and initialize final raster
-        base_raster_path = validated_layers[0]['raster_path']
-        try:
-            with rasterio.open(base_raster_path) as src:
-                final_raster = np.zeros(src.shape, dtype=np.float32)
-                meta = src.meta.copy()
-                target_crs = src.crs
-                target_shape = src.shape
-                print(f"TOOL: Base raster shape: {src.shape}, CRS: {target_crs}")
-        except Exception as e:
-            return f"Error reading base raster '{os.path.basename(base_raster_path)}': {e}"
-
-        # Process each layer
-        for layer in validated_layers:
-            raster_path = layer['raster_path']
-            weight = layer['weight']
-            
-            try:
-                with rasterio.open(raster_path) as lyr_src:
-                    if lyr_src.crs != target_crs:
-                        print(f"WARNING: CRS mismatch for {os.path.basename(raster_path)}. Expected {target_crs}, got {lyr_src.crs}")
-                        return f"Error: CRS mismatch in weighted overlay. Layer '{os.path.basename(raster_path)}' does not match base layer CRS."
-                    
-                    layer_data = lyr_src.read(1)
-                    if layer_data.shape != target_shape:
-                        return f"Error: Shape mismatch in weighted overlay. Layer '{os.path.basename(raster_path)}' shape {layer_data.shape} does not match base shape {target_shape}."
-                    
-                    # Add weighted layer to final result
-                    layer_data = layer_data.astype(np.float32)
-                    final_raster += layer_data * weight
-                    print(f"TOOL: Added layer {os.path.basename(raster_path)} (weight: {weight})")
-            except Exception as e:
-                return f"Error processing layer '{os.path.basename(raster_path)}': {e}"
-                
-        # Write the final result
-        filepath = get_output_filepath("suitability_map.tif")  # Will use thread context automatically
-        meta.update(dtype='float32')
-        try:
-            with rasterio.open(filepath, 'w', **meta) as dst:
-                dst.write(final_raster, 1)
-            print(f"TOOL: Weighted overlay complete. Output saved to: {filepath}")
-            return filepath
-        except Exception as e:
-            return f"Error writing output file '{filepath}': {e}"
+        all_datasets = load_dataset_metadata()
     except Exception as e:
-        return f"Error during weighted overlay: {e}"
+        raise ToolExecutionError(f"Fatal error: Could not load or parse info.json. {e}", "get_data_from_ps4")
 
-def compare_places_analysis(places: list, layer_type: str, comparison_method: str = "difference") -> str:
-    """
-    Compares the same layer type across multiple places.
-    
-    Args:
-        places: List of place names to compare (e.g., ["Chennai", "Mumbai", "Delhi"])
-        layer_type: Type of layer to compare (e.g., "slope", "proximity", "dem")
-        comparison_method: How to compare - "difference", "ratio", "overlay"
-    
-    Returns:
-        Path to comparison result raster
-    """
-    try:
-        print(f"TOOL: Comparing {layer_type} layers across places: {places}")
-        
-        output_dir = settings.MEDIA_ROOT
-        
-        # Find layer files for each place using direct identification
-        place_files = {}
-        for place in places:
-            # Try direct lookup first (simpler and faster for comparison workflows)
-            file_path = find_layer_by_place_direct(place, layer_type)
-            if not file_path:
-                # Fallback to pattern-based lookup
-                file_path = find_layer_by_place_and_type(place, layer_type, output_dir)
-            
-            if file_path:
-                place_files[place] = file_path
-                print(f"TOOL: Found {layer_type} for {place}: {os.path.basename(file_path)}")
-            else:
-                return f"Error: Could not find {layer_type} layer for place '{place}'"
-        
-        if len(place_files) < 2:
-            return f"Error: Need at least 2 places for comparison, found {len(place_files)}"
-        
-        # Load the rasters
-        raster_data = {}
-        base_meta = None
-        
-        for place, file_path in place_files.items():
-            with _validate_and_read_raster(file_path) as src:
-                raster_data[place] = src.read(1).astype(np.float32)
-                if base_meta is None:
-                    base_meta = src.meta.copy()
-                    base_shape = raster_data[place].shape
-                    base_crs = src.crs
-                else:
-                    # Check compatibility
-                    if raster_data[place].shape != base_shape:
-                        print(f"WARNING: Shape mismatch for {place}. Expected {base_shape}, got {raster_data[place].shape}")
-                    if src.crs != base_crs:
-                        print(f"WARNING: CRS mismatch for {place}. Expected {base_crs}, got {src.crs}")
-        
-        # Perform comparison based on method
-        if comparison_method == "difference":
-            # Calculate difference between first two places
-            place_names = list(place_files.keys())
-            result_data = raster_data[place_names[0]] - raster_data[place_names[1]]
-            comparison_name = f"{place_names[0]}_minus_{place_names[1]}"
-            
-        elif comparison_method == "ratio":
-            # Calculate ratio between first two places
-            place_names = list(place_files.keys())
-            denominator = raster_data[place_names[1]]
-            # Avoid division by zero
-            denominator[denominator == 0] = 0.001
-            result_data = raster_data[place_names[0]] / denominator
-            comparison_name = f"{place_names[0]}_ratio_{place_names[1]}"
-            
-        elif comparison_method == "overlay":
-            # Create a multi-band overlay showing all places
-            place_names = list(place_files.keys())
-            # For simplicity, average all rasters
-            result_data = np.mean([raster_data[place] for place in place_names], axis=0)
-            comparison_name = f"{'_'.join(place_names)}_overlay"
-            
-        else:
-            return f"Error: Unknown comparison method '{comparison_method}'. Use 'difference', 'ratio', or 'overlay'."
-        
-        # Save result
-        filename = f"comparison_{layer_type}_{comparison_name}.tif"
-        filepath = get_output_filepath(filename)
-        
-        base_meta.update(dtype='float32')
-        with rasterio.open(filepath, 'w', **base_meta) as dst:
-            dst.write(result_data.astype(np.float32), 1)
-        
-        print(f"TOOL: Multi-place comparison complete. Output saved to: {filepath}")
-        return filepath
-        
-    except Exception as e:
-        return f"Error during multi-place comparison: {e}"
+    # 2. Find the requested dataset's information in the manifest
+    target_dataset_info = next((item for item in all_datasets if item.get('name') == data_name), None)
 
-def perform_sequential_comparison_workflow(places: list, layer_types: list, weights: dict = None) -> str:
-    """
-    DEPRECATED: This tool is being phased out in favor of explicit agent-driven workflows.
-    The agent should create explicit, sequential plans for comparisons instead of using this "magical" tool.
+    if not target_dataset_info:
+        raise ToolValidationError(
+            f"The dataset '{data_name}' is not listed in the info.json manifest. Cannot proceed.",
+            "get_data_from_ps4"
+        )
     
-    Optimized tool for comparison workflows that processes places sequentially.
-    Takes advantage of the fact that each place is processed independently and completely.
-    
-    Args:
-        places: List of places to compare (e.g., ["Chennai", "Mumbai"])
-        layer_types: List of layer types to include (e.g., ["slope_reclass", "proximity_reclass"])
-        weights: Optional weights for weighted overlay {layer_type: weight}
-    
-    Returns:
-        Path to final comparison result
-    """
-    print("WARNING: perform_sequential_comparison_workflow is deprecated. Agent should create explicit workflows instead.")
-    
-    try:
-        print(f"TOOL: Sequential comparison workflow for places: {places}, layers: {layer_types}")
+    # 3. Get the authoritative file type from the manifest
+    file_type = target_dataset_info.get('file_type')
+    if not file_type:
+        raise ToolValidationError(
+            f"The dataset '{data_name}' in info.json is missing the required 'file_type' attribute.",
+            "get_data_from_ps4"
+        )
         
-        if len(places) < 2:
-            return "Error: Need at least 2 places for comparison"
-        
-        # Build layer_weights dictionary for weighted overlay using direct place references
-        if weights is None:
-            # Default equal weights
-            weight_per_layer = 1.0 / len(layer_types) if layer_types else 1.0
-            weights = {layer: weight_per_layer for layer in layer_types}
-        
-        # Build layers list for new perform_weighted_overlay format
-        layers = []
-        for place in places:
-            place_weight = 1.0 / len(places)  # Equal weight per place
-            for layer_type in layer_types:
-                # Try to find the layer file using the direct lookup
-                file_path = find_layer_by_place_direct(place, layer_type)
-                if file_path:
-                    layer_weight = weights.get(layer_type, 0) * place_weight
-                    if layer_weight > 0:
-                        layers.append({
-                            'raster_path': file_path,
-                            'weight': layer_weight
-                        })
-                else:
-                    return f"Error: Could not find {layer_type} layer for place '{place}'"
-        
-        print(f"TOOL: Generated layers list for comparison: {len(layers)} layers")
-        
-        # Use the new weighted overlay function format
-        return perform_weighted_overlay(layers)
-        
-    except Exception as e:
-        return f"Error during sequential comparison workflow: {e}"
+    base_ps4_dir = os.path.join(settings.BASE_DIR, "PS-4")
 
+    # 4. Use the file_type to determine the search strategy
+    if file_type == 'vector':
+        # For vectors, the 'name' is the folder name.
+        folder_path = os.path.join(base_ps4_dir, data_name)
+        if not os.path.isdir(folder_path):
+            raise ToolExecutionError(f"Vector dataset '{data_name}' not found. Expected a folder at: {folder_path}", "get_data_from_ps4")
+        
+        for fname in os.listdir(folder_path):
+            if fname.lower().endswith('.shp'):
+                return os.path.join(folder_path, fname)
+        
+        raise ToolExecutionError(f"Vector folder '{data_name}' exists but contains no .shp file.", "get_data_from_ps4")
+
+    elif file_type == 'raster':
+        # For rasters, the 'name' is the base filename.
+        raster_extensions = ['.tif', '.tiff', '.img', '.jp2']
+        for ext in raster_extensions:
+            file_path = os.path.join(base_ps4_dir, f"{data_name}{ext}")
+            if os.path.isfile(file_path):
+                return file_path
+        
+        raise ToolExecutionError(f"Raster dataset '{data_name}' not found. Searched for files like '{data_name}.tif' in the PS4 directory.", "get_data_from_ps4")
+
+    else:
+        # Handle unknown file types
+        raise ToolValidationError(
+            f"Unsupported file_type '{file_type}' for dataset '{data_name}' in info.json.",
+            "get_data_from_ps4"
+        )
+
+@register_tool
+@validate_call
+def select_and_rasterize_vector(
+    vector_path: FilePath,
+    attribute_name: str,
+    attribute_value: str,
+    reference_raster_path: FilePath
+) -> FilePath:
+    """
+    Selects vector features by attribute and converts them into a binary raster.
+
+    This tool is essential for using vector data (like land use polygons) as a
+    criterion in a raster-based suitability analysis. It first selects all features
+    matching a query (e.g., attribute 'LULC_TYPE' = 'Forest') and then creates a
+    raster where pixels inside these selected polygons have a value of 1, and all
+    other pixels have a value of 0.
+
+    When to Use:
+    - When a suitability criterion is based on vector data (e.g., land use, soil type).
+    - Use this to create a binary raster (1=suitable, 0=unsuitable) from a vector
+      layer before combining it with other raster criteria in `perform_weighted_overlay`.
+
+    Important Note:
+    - The `reference_raster_path` is used to match the output raster's cell size,
+      extent, and CRS, ensuring all layers align perfectly.
+    """
+    # Step 1: Select features by attribute
+    selected_vector_path = run_qgis_process(
+        'native:extractbyattribute',
+        {
+            'INPUT': str(vector_path),
+            'FIELD': attribute_name,
+            'OPERATOR': 0,  # 0 corresponds to '='
+            'VALUE': attribute_value,
+            'OUTPUT': ''
+        },
+        'selected_vector'
+    )
+
+    # Step 2: Rasterize the selected vector features
+    rasterized_path = run_qgis_process(
+        'gdal:rasterize',
+        {
+            'INPUT': selected_vector_path,
+            'FIELD': '',  # We are not burning an attribute value, just a fixed value
+            'BURN': 1,    # The value to burn into the raster for the selected features
+            'UNITS': 1,   # 1 = Pixels
+            'WIDTH': 0,   # These are determined by the reference layer
+            'HEIGHT': 0,  # These are determined by the reference layer
+            'EXTENT': str(reference_raster_path), # Match the extent of another raster
+            'NODATA': 0,  # Pixels outside the polygons will be 0
+            'DATA_TYPE': 5, # 5 = Float32
+            'OUTPUT': ''
+        },
+        'rasterized_vector'
+    )
+    return rasterized_path

@@ -1,0 +1,6 @@
+--2025-08-07 17:31:08--  https://keyserver.ubuntu.com/pks/lookup?op=get
+Resolving keyserver.ubuntu.com (keyserver.ubuntu.com)... 185.125.188.26, 185.125.188.27, 2620:2d:4000:1007::d43, ...
+Connecting to keyserver.ubuntu.com (keyserver.ubuntu.com)|185.125.188.26|:443... connected.
+HTTP request sent, awaiting response... 400 Bad Request
+2025-08-07 17:31:09 ERROR 400: Bad Request.
+

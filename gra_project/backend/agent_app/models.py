@@ -1,10 +1,14 @@
+# --- START OF FILE models.py ---
+
 from django.db import models
 import uuid
 import os
+from werkzeug.utils import secure_filename
 
 def get_upload_path(instance, filename):
     """Generate upload path: user_uploads/<thread_id>/<filename>"""
-    return os.path.join('user_uploads', str(instance.thread.id), filename)
+    safe_filename = secure_filename(filename)
+    return os.path.join('user_uploads', str(instance.thread.id), safe_filename)
 
 class AnalysisThread(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -17,15 +21,12 @@ class AnalysisThread(models.Model):
 class ThreadMessage(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     thread = models.ForeignKey(AnalysisThread, related_name='messages', on_delete=models.CASCADE)
-    
-    # Message content
     user_query = models.TextField(blank=True, null=True)
     agent_explanation = models.TextField(blank=True, null=True)
     agent_workflow_plan = models.JSONField(blank=True, null=True)
     user_edited_workflow_plan = models.JSONField(blank=True, null=True)
-    execution_log = models.JSONField(blank=True, null=True) # Store logs as a list of events
+    execution_log = models.JSONField(blank=True, null=True)
     final_map_result = models.JSONField(blank=True, null=True)
-    
     timestamp = models.DateTimeField(auto_now_add=True)
 
     class Meta:
