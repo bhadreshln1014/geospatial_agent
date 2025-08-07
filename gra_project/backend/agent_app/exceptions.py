@@ -1,3 +1,5 @@
+# --- START OF FILE exceptions.py ---
+
 """
 Custom exceptions for the GIS workflow system to ensure clear, predictable error handling.
 """
