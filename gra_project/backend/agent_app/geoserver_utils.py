@@ -1,7 +1,9 @@
 # --- START OF FILE geoserver_utils.py ---
+from django.http import HttpResponse
 import requests
 import os
 from django.conf import settings
+from django.views.decorators.csrf import csrf_exempt
 
 # Load GeoServer configuration from Django settings
 GS_CONFIG = settings.GEOSERVER_SETTINGS
@@ -63,3 +65,22 @@ def publish_gpkg(file_path: str, layer_name: str):
         print(f"WARNING: Could not set default style for {layer_name}. WFS may not work. Error: {e}")
 
     return f"{WORKSPACE}:{layer_name}"
+
+@csrf_exempt
+def wms_proxy(request):
+    """
+    Proxies WMS requests from the frontend to GeoServer to avoid CORS/ORB issues.
+    """
+    # Get the base GeoServer WMS endpoint from settings
+    geoserver_url = f"{settings.GEOSERVER_SETTINGS['URL']}/geospatial_agent/wms"
+
+    # Forward all query params from the incoming request
+    resp = requests.get(geoserver_url, params=request.GET.dict(), stream=True)
+    print("Proxying to:", resp.url)
+
+    # Pass through the content type from GeoServer (usually image/png)
+    return HttpResponse(
+        resp.content,
+        content_type=resp.headers.get('Content-Type', 'image/png'),
+        status=resp.status_code
+    )

@@ -160,6 +160,14 @@ def setup_planner_agent():
                         "reasoning": "Retrieving the slope raster for Sikkim, as listed in the available datasets."
                         }}
                         ```
+                **Context for this specific request:**
+                {roi_context}
+            3.  **Region of Interest (ROI) Handling (ABSOLUTE PRIORITY):**
+                -   If the context message above states that a user-defined ROI is available, your plan MUST reflect this.
+                -   The **FIRST step** after loading any dataset (e.g., via `get_data_from_ps4` or `acquire_data_from_url`) MUST be to use the `clip_data_to_roi` tool.
+                -   This ensures all subsequent analysis is focused ONLY on the area the user drew.
+                -   All subsequent steps in your plan MUST use the output of the `clip_data_to_roi` step, not the original full-sized layer.
+                -   Example: If you load `Assam_LULC`, the next step must be `clip_data_to_roi(data_to_clip_path='##step_1_output##')`. The rest of the analysis will then use `##step_2_output##`.
 
 4.  **Build Plan:** Select tools step-by-step, referencing outputs with `##step_N_output##`.
 

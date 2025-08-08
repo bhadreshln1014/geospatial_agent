@@ -78,7 +78,7 @@ interface MapResult {
   layer_name?: string;
 }
 
-
+        
 export default function GeospatialAnalysisPlatform() {
   const [activeThread, setActiveThread] = useState<Thread | null>(null)
   const [threads, setThreads] = useState<Thread[]>([])
@@ -173,47 +173,54 @@ export default function GeospatialAnalysisPlatform() {
     }
   }
 
-  const handleRoiSelected = (roiGeoJson: any) => {
+  const handleRoiSelected = async (roiGeoJson: any | null) => {
+    console.log("SUCCESS: 'handleRoiSelected' fired in the parent component!", roiGeoJson);
     setRoi(roiGeoJson);
+    if (!activeThread) {
+      toast({ title: "Error", description: "No active thread selected. Cannot save ROI.", variant: "destructive" });
+      return;
+    }
+    try {
+      if (roiGeoJson === null) {
+        await apiService('/roi/', {
+          method: 'DELETE',
+          body: JSON.stringify({ thread_id: activeThread.id }),
+        });
+        toast({ title: "ROI Cleared", description: `The Region of Interest has been removed.` });
+      } else {
+        await apiService('/roi/', {
+          method: 'POST',
+          body: JSON.stringify({ thread_id: activeThread.id, roi: roiGeoJson }),
+        });
+        toast({ title: "ROI Saved", description: `Region of Interest has been saved successfully.` });
+      }
+    } catch (error) {
+       toast({ title: "ROI Save Error", description: "Could not sync ROI with the backend.", variant: "destructive" });
+    }
     setRoiDialogOpen(false);
-    toast({
-      title: "Region of Interest Set",
-      description: `ROI area has been captured successfully.`,
-    });
   };
 
   const handleGeneratePlan = async () => {
-    if (!userQuery.trim() || !activeThread) return
-
-    setIsGeneratingPlan(true)
+    if (!userQuery.trim() || !activeThread) return;
+    setIsGeneratingPlan(true);
     try {
       const requestBody = {
         thread_id: activeThread.id,
         query: userQuery,
-        roi: roi,
       };
-
       const planData = await apiService<ThreadMessage>('/plan/', {
         method: 'POST',
         body: JSON.stringify(requestBody),
       });
-      
       setWorkflowPlan(planData.agent_workflow_plan || null);
       setActiveMessage(planData);
-      toast({
-        title: "Plan Generated",
-        description: "Workflow plan has been generated successfully.",
-      })
+      toast({ title: "Plan Generated", description: "Workflow plan generated successfully." });
     } catch (error) {
-      toast({
-        title: "Error",
-        description: "Failed to generate plan. Please try again.",
-        variant: "destructive",
-      })
+      toast({ title: "Error", description: "Failed to generate plan.", variant: "destructive" });
     } finally {
-      setIsGeneratingPlan(false)
+      setIsGeneratingPlan(false);
     }
-  }
+  };
 
   const handleExecuteWorkflow = async () => {
     if (!workflowPlan || !activeThread || !activeMessage) return
@@ -262,7 +269,7 @@ export default function GeospatialAnalysisPlatform() {
         if (data.map_result) {
             setMapResult(data.map_result);
         }
-        
+
         eventSource.close();
         setIsExecuting(false);
         toast({

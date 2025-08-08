@@ -1,3 +1,4 @@
+// --- START OF FILE RoiMap.tsx (Final Version) ---
 "use client"
 
 import { useRef } from 'react';
@@ -5,10 +6,10 @@ import L from 'leaflet';
 import { MapContainer, TileLayer, FeatureGroup } from 'react-leaflet';
 import { EditControl } from 'react-leaflet-draw';
 
-// Import the CSS for the drawing tools
+import 'leaflet/dist/leaflet.css';
 import 'leaflet-draw/dist/leaflet.draw.css';
 
-// Fix for Leaflet icons with bundlers
+// Leaflet icon fix
 delete (L.Icon.Default.prototype as any)._getIconUrl;
 L.Icon.Default.mergeOptions({
   iconRetinaUrl: require('leaflet/dist/images/marker-icon-2x.png').default,
@@ -17,34 +18,37 @@ L.Icon.Default.mergeOptions({
 });
 
 interface RoiMapProps {
-  // The callback now sends a GeoJSON Polygon object
-  onRoiSelected: (roiGeoJson: any) => void;
+  onRoiSelected: (roi: any | null) => void;
 }
 
 export default function RoiMap({ onRoiSelected }: RoiMapProps) {
   const featureGroupRef = useRef<L.FeatureGroup>(null);
 
   const handleCreate = (e: any) => {
+    console.log("SUCCESS: 'handleCreate' fired inside RoiMap.tsx");
     const layer = e.layer;
-    if (layer && featureGroupRef.current) {
-      // Clear previous drawings
-      featureGroupRef.current.clearLayers();
-      // Add the new layer
-      featureGroupRef.current.addLayer(layer);
-
-      // --- CHANGE: Convert the drawn layer to a GeoJSON object ---
-      const geoJson = layer.toGeoJSON();
-      
-      // Send the entire GeoJSON object back to the parent component
-      onRoiSelected(geoJson);
+    if (layer) {
+      onRoiSelected(layer.toGeoJSON());
     }
   };
 
+  const handleEdit = (e: any) => {
+    const layers = e.layers.getLayers();
+    if (layers.length > 0) {
+      const editedLayer = layers[0];
+      onRoiSelected(editedLayer.toGeoJSON());
+    }
+  };
+
+  const handleDelete = () => {
+    onRoiSelected(null);
+  };
+
   return (
-    <MapContainer 
-      center={[20.5937, 78.9629]} // Centered on India
-      zoom={5} 
-      style={{ height: '500px', width: '100%' }}
+    <MapContainer
+      center={[20.5937, 78.9629]}
+      zoom={5}
+      style={{ height: '60vh', width: '100%', borderRadius: '5px' }}
     >
       <TileLayer
         url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
@@ -55,20 +59,14 @@ export default function RoiMap({ onRoiSelected }: RoiMapProps) {
         <EditControl
           position="topright"
           onCreated={handleCreate}
+          onEdited={handleEdit}
+          onDeleted={handleDelete}
           draw={{
-            // --- CHANGE: Enable polygon drawing, disable rectangle ---
-            polygon: true,
-            rectangle: false,
-            // ---
-            circle: false,
-            circlemarker: false,
-            marker: false,
-            polyline: false,
+            polygon: { allowIntersection: false, showArea: true },
+            rectangle: false, circle: false, circlemarker: false,
+            marker: false, polyline: false,
           }}
-          edit={{
-            edit: false,
-            remove: true,
-          }}
+          edit={{ featureGroup: featureGroupRef.current! }}
         />
       </FeatureGroup>
     </MapContainer>

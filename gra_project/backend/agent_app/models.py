@@ -46,3 +46,12 @@ class UserDataLayer(models.Model):
 
     class Meta:
         ordering = ['created_at']
+
+class AnalysisROI(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    thread = models.OneToOneField(AnalysisThread, related_name='roi', on_delete=models.CASCADE)
+    geometry = models.JSONField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"ROI for {self.thread.title}"

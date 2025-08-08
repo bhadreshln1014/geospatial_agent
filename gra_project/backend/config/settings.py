@@ -151,8 +151,8 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'output')
 # settings.py
 
 GEOSERVER_SETTINGS = {
-    'URL': 'http://localhost:8080/geoserver',
+    'URL': 'http://172.25.132.15:8080/geoserver',
     'USER': 'admin',
-    'PASSWORD': 'geoserver',
-    'WORKSPACE': 'geoagent',
+    'PASSWORD': 'geospatial123',
+    'WORKSPACE': 'geospatial_agent',
 }

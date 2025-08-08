@@ -1,4 +1,4 @@
-# --- START OF FILE views.py ---
+# --- START OF FILE views.py (Corrected) ---
 
 from django.http import StreamingHttpResponse, JsonResponse, Http404, FileResponse
 from django.views import View
@@ -10,7 +10,7 @@ import zipfile, json, os, shutil, geopandas as gpd, rasterio, rasterio.warp
 from .exceptions import ToolValidationError, ToolExecutionError
 from pydantic import ValidationError
 from .agent import setup_planner_agent, get_tool_schemas_as_text, WorkflowPlan
-from .models import AnalysisThread, ThreadMessage, UserDataLayer
+from .models import AnalysisROI, AnalysisThread, ThreadMessage, UserDataLayer
 from . import tools as gis_tools
 from . import geoserver_utils
 from django.http import JsonResponse
@@ -38,7 +38,17 @@ class PlannerView(APIView):
             try: thread = AnalysisThread.objects.get(id=thread_id)
             except AnalysisThread.DoesNotExist: return Response({"error": "Thread not found"}, status=404)
         else: thread = AnalysisThread.objects.create(title=query[:50])
-        
+
+        # --- START: ADDED ROI CONTEXT LOGIC ---
+        roi_context_message = "No user-defined Region of Interest (ROI) has been provided. The analysis should cover the entire extent of the selected datasets unless a specific location name is mentioned in the query."
+        try:
+            if AnalysisROI.objects.filter(thread=thread).exists():
+                roi_context_message = "A user-defined Region of Interest (ROI) has been provided. Your plan MUST use the `clip_data_to_roi` tool as the first step after loading any data layer to clip it to this ROI."
+        except Exception as e:
+            # If the database check fails, proceed without ROI context.
+            print(f"Warning: Could not check for ROI. Proceeding without it. Error: {e}")
+        # --- END: ADDED ROI CONTEXT LOGIC ---
+
         # Try to load info.json from PS4 directory
         ps4_info_path = os.path.join(settings.BASE_DIR, "PS4", "info.json")
         user_data_context = None
@@ -55,7 +65,7 @@ class PlannerView(APIView):
         format_instructions = parser.get_format_instructions() + "\n\nIMPORTANT: Your output MUST be a single, valid JSON object."
         
         try:
-            response_model = setup_planner_agent().invoke({"input": query, "user_data_context": user_data_context, "tool_list_str": tool_list_str, "format_instructions": format_instructions})
+            response_model = setup_planner_agent().invoke({"input": query, "user_data_context": user_data_context, "roi_context": roi_context_message, "tool_list_str": tool_list_str, "format_instructions": format_instructions})
             message = ThreadMessage.objects.create(thread=thread, user_query=query, agent_explanation=response_model.overall_reasoning, agent_workflow_plan=response_model.dict())
             return Response({"thread_id": str(thread.id), "plan_id": str(message.id), "workflow_plan": response_model.dict()})
         except Exception as e: return Response({"error": f"Failed to generate a plan: {str(e)}"}, status=500)
@@ -112,6 +122,8 @@ class ExecutorStreamView(View):
             place_name = next((p['value'] for s in plan for p in s['parameters'] if p['name'] == 'place_name'), "default_place")
             gis_tools.set_workflow_context(str(message.thread.id), place_name)
             
+            final_result = None # Variable to hold the final result after the loop
+
             try:
                 for i, step in enumerate(plan):
                     step_num, tool_name, params = i + 1, step['tool_name'], {}
@@ -119,8 +131,8 @@ class ExecutorStreamView(View):
                     def resolve_value(value):
                         if isinstance(value, str):
                             if value.startswith("##step_"):
-                                step_num = int(value.split('_')[1].split('##')[0])
-                                return step_outputs.get(step_num, "")
+                                resolve_step_num = int(value.split('_')[1].split('##')[0])
+                                return step_outputs.get(resolve_step_num, "")
                             if value.startswith("user_layer_"):
                                 layer_id = value.replace("user_layer_", "")
                                 try:
@@ -146,7 +158,6 @@ class ExecutorStreamView(View):
                                 for item in reclass_raw
                             ]
                         elif isinstance(reclass_raw, list) and all(isinstance(item, list) for item in reclass_raw):
-                            # Already correct
                             pass
                         else:
                             raise ValueError(f"Invalid reclass_values format: {reclass_raw}")
@@ -155,128 +166,70 @@ class ExecutorStreamView(View):
                     if tool_name not in TOOL_MAPPING: raise NotImplementedError(f"Tool '{tool_name}' not defined.")
                     
                     result = TOOL_MAPPING[tool_name](**params)
-                    step_outputs[step_num], final_content = result, result if isinstance(result, dict) else os.path.basename(str(result))
-                    yield f"data: {json.dumps({'type': 'log', 'content': f'✅ Step {step_num} complete. Output: {final_content}'})}\n\n"
-                    if i == len(plan) - 1: message.final_map_result = {'final_output': result}
+                    step_outputs[step_num] = result
+                    final_result = result # Update final_result in each iteration
+                    
+                    log_content = os.path.basename(str(result)) if isinstance(result, str) else result
+                    yield f"data: {json.dumps({'type': 'log', 'content': f'✅ Step {step_num} complete. Output: {log_content}'})}\n\n"
+
             except (ToolValidationError, ToolExecutionError) as e:
                 error_message = f"❌ FAILED at Step {locals().get('step_num', '?')} ({e.tool_name}): {e.message}"
-                log_entry = {'type': 'error', 'content': error_message}
-                yield f"data: {json.dumps(log_entry)}\n\n"
-                message.save(); return
+                yield f"data: {json.dumps({'type': 'error', 'content': error_message})}\n\n"; return
             except Exception as e:
                 error_message = f"❌ UNEXPECTED error at Step {locals().get('step_num', '?')} ({locals().get('tool_name', '?')}): {str(e)}"
-                log_entry = {'type': 'error', 'content': error_message}
-                yield f"data: {json.dumps(log_entry)}\n\n"
-                message.save(); return
+                yield f"data: {json.dumps({'type': 'error', 'content': error_message})}\n\n"; return
             
-            message.save()
-            
-            # ###############################################################
-            # ### START: MODIFIED FINAL MESSAGE AND VISUALIZATION BLOCK   ###
-            # ###############################################################
-            if final_result and isinstance(final_result, str) and os.path.exists(final_result):
-                try:
-                    # --- PATH 1: Handle GeoJSON by sending data directly to the frontend ---
+            # --- START: CORRECTED FINAL MESSAGE AND VISUALIZATION BLOCK ---
+            try:
+                # Case 1: The final result is a file path (string)
+                if isinstance(final_result, str) and os.path.exists(final_result):
                     if final_result.lower().endswith('.geojson'):
                         yield f"data: {json.dumps({'type': 'log', 'content': 'Reading GeoJSON result to send to client...'})}\n\n"
-                        
-                        # Read the GeoJSON file content
-                        with open(final_result, 'r') as f:
-                            geojson_data = json.load(f)
-
-                        # Calculate BBOX for Leaflet using GeoPandas
-                        gdf = gpd.read_file(final_result)
-                        b = gdf.to_crs(epsg=4326).total_bounds
-                        bbox = [b[1], b[0], b[3], b[2]] # Format: [south, west, north, east]
-
-                        # Prepare the payload for direct rendering on the client
-                        direct_map_data = {
-                            "type": 'vector',
-                            "data": geojson_data,  # Embed the actual GeoJSON data
-                            "bbox": bbox,
-                            "name": os.path.basename(final_result),
-                            "service_type": "geojson" # Special type to signal the frontend
-                        }
-                        
-                        message.final_map_result = direct_map_data
-                        message.save()
-                        yield f"data: {json.dumps({'type': 'complete', 'content': '🎉 Workflow Finished! GeoJSON data sent to client.', 'map_result': direct_map_data})}\n\n"
-
-                    # --- PATH 2: Handle Rasters and other formats by publishing to GeoServer ---
+                        with open(final_result, 'r') as f: geojson_data = json.load(f)
+                        gdf = gpd.read_file(final_result); b = gdf.to_crs(epsg=4326).total_bounds; bbox = [b[1], b[0], b[3], b[2]]
+                        map_data = {"type": 'vector', "data": geojson_data, "bbox": bbox, "name": os.path.basename(final_result), "service_type": "geojson"}
+                        message.final_map_result = map_data; message.save()
+                        yield f"data: {json.dumps({'type': 'complete', 'content': '🎉 Workflow Finished! GeoJSON data sent to client.', 'map_result': map_data})}\n\n"
                     else:
                         base_name = os.path.splitext(os.path.basename(final_result))[0]
                         layer_name = f"{message.thread.id}_{base_name}".replace('-', '_')
-
+                        service_type = 'WMS' # Default service type
+                        
                         if final_result.lower().endswith(('.tif', '.tiff')):
                             file_type = 'raster'
                             yield f"data: {json.dumps({'type': 'log', 'content': f'Publishing raster layer to GeoServer as `{layer_name}`...'})}\n\n"
                             qualified_layer_name = geoserver_utils.publish_geotiff(final_result, layer_name)
-                            service_type = 'WMS'
-                        else: # Handle other types like GPKG
+                        else:
                             file_type = 'vector'
                             yield f"data: {json.dumps({'type': 'log', 'content': f'Publishing vector layer to GeoServer as `{layer_name}`...'})}\n\n"
                             qualified_layer_name = geoserver_utils.publish_gpkg(final_result, layer_name)
-                            service_type = 'WMS'
                         
-                        # Calculate BBOX for Leaflet
                         bbox = None
                         if file_type == 'vector':
-                            gdf = gpd.read_file(final_result)
-                            b = gdf.to_crs(epsg=4326).total_bounds
-                            bbox = [b[1], b[0], b[3], b[2]]
-                        else: # raster
-                            with rasterio.open(final_result) as src:
-                                b = rasterio.warp.transform_bounds(src.crs, 'EPSG:4326', *src.bounds)
-                                bbox = [b[1], b[0], b[3], b[2]]
-
-                        geoserver_map_data = {
-                            "service_type": service_type,
-                            "layer_name": qualified_layer_name,
-                            "geoserver_url": settings.GEOSERVER_SETTINGS['URL'],
-                            "bbox": bbox,
-                            "name": os.path.basename(final_result)
-                        }
+                            gdf = gpd.read_file(final_result); b = gdf.to_crs(epsg=4326).total_bounds; bbox = [b[1], b[0], b[3], b[2]]
+                        else:
+                            with rasterio.open(final_result) as src: b = rasterio.warp.transform_bounds(src.crs, 'EPSG:4326', *src.bounds); bbox = [b[1], b[0], b[3], b[2]]
                         
-                        message.final_map_result = geoserver_map_data
-                        message.save()
-                        yield f"data: {json.dumps({'type': 'complete', 'content': '🎉 Workflow Finished! Layer published to GeoServer.', 'map_result': geoserver_map_data})}\n\n"
-
-                except Exception as e:
-                    error_message = f"❌ FAILED during final result processing: {str(e)}"
-                    yield f"data: {json.dumps({'type': 'error', 'content': error_message})}\n\n"
-            
-            # Handle case where the final result is a JSON object (e.g., from a statistics tool)
-            elif final_result and isinstance(final_result, dict):
-                message.final_map_result = {'stats_result': final_result}
-                message.save()
-                yield f"data: {json.dumps({'type': 'complete', 'content': '🎉 Workflow Finished!', 'stats_result': final_result})}\n\n"
-            
-            # Handle case where there is no final output
-            final_output = message.final_map_result.get('final_output') if message.final_map_result else None
-
-            if isinstance(final_output, dict):
-                yield f"data: {json.dumps({'type': 'complete', 'content': '🎉 Workflow Finished!', 'stats_result': final_output})}\n\n"
-            elif isinstance(final_output, str) and os.path.exists(final_output):
-                relative_path = os.path.relpath(final_output, settings.MEDIA_ROOT)
-                file_url, file_type = request.build_absolute_uri(f"/media/{relative_path.replace(os.path.sep, '/')}"), 'raster' if relative_path.lower().endswith('.tif') else 'vector'
-                metadata, bbox = {}, None
-                try:
-                    if file_type == 'vector':
-                        gdf = gpd.read_file(final_output); b = gdf.to_crs(epsg=4326).total_bounds; bbox = [b[1], b[0], b[3], b[2]]
-                        metadata.update({'crs': gdf.crs.to_string(), 'feature_count': len(gdf)})
-                    else:
-                        with rasterio.open(final_output) as src:
-                            b = rasterio.warp.transform_bounds(src.crs, 'EPSG:4326', *src.bounds); bbox = [b[1], b[0], b[3], b[2]]
-                            band = src.read(1); metadata.update({'crs': src.crs.to_string(), 'resolution': src.res, 'min_value': float(band.min()), 'max_value': float(band.max())})
-                except Exception as e: print(f"Could not calculate BBOX/Metadata: {e}")
+                        map_data = {"service_type": service_type, "layer_name": qualified_layer_name, "geoserver_url": settings.GEOSERVER_SETTINGS['URL'], "bbox": bbox, "name": os.path.basename(final_result)}
+                        message.final_map_result = map_data; message.save()
+                        yield f"data: {json.dumps({'type': 'complete', 'content': '🎉 Workflow Finished! Layer published to GeoServer.', 'map_result': map_data})}\n\n"
                 
-                map_data = {"url": file_url, "type": file_type, "bbox": bbox, "name": os.path.basename(relative_path), "metadata": metadata}
-                yield f"data: {json.dumps({'type': 'complete', 'content': '🎉 Workflow Finished!', 'map_result': map_data})}\n\n"
-            else:
-                yield f"data: {json.dumps({'type': 'complete', 'content': 'Workflow Finished! No map output was generated.'})}\n\n"
-        
-        return create_sse_response(event_stream_generator())
+                # Case 2: The final result is a dictionary (e.g., statistics)
+                elif isinstance(final_result, dict):
+                    message.final_map_result = {'stats_result': final_result}
+                    message.save()
+                    yield f"data: {json.dumps({'type': 'complete', 'content': '🎉 Workflow Finished!', 'stats_result': final_result})}\n\n"
+                
+                # Case 3: No valid output was generated
+                else:
+                    yield f"data: {json.dumps({'type': 'complete', 'content': 'Workflow Finished! No map output was generated.'})}\n\n"
+            
+            except Exception as e:
+                error_message = f"❌ FAILED during final result processing: {str(e)}"
+                yield f"data: {json.dumps({'type': 'error', 'content': error_message})}\n\n"
+            # --- END: CORRECTED FINAL MESSAGE AND VISUALIZATION BLOCK ---
 
+        return create_sse_response(event_stream_generator())
 
 
 class ThreadListView(APIView):
@@ -315,3 +268,33 @@ class ThreadLayersView(APIView):
             return Response(data)
         except AnalysisThread.DoesNotExist:
             return Response({"error": "Thread not found"}, status=404)
+
+class RoiView(APIView):
+    def post(self, request, *args, **kwargs):
+        thread_id = request.data.get('thread_id')
+        roi_geometry = request.data.get('roi')
+        if not thread_id or not roi_geometry:
+            return Response({"error": "thread_id and roi are required"}, status=400)
+        try:
+            thread = AnalysisThread.objects.get(id=thread_id)
+        except AnalysisThread.DoesNotExist:
+            return Response({"error": "Thread not found"}, status=404)
+        geometry_data = roi_geometry.get('geometry')
+        if not geometry_data:
+            return Response({"error": "Invalid GeoJSON."}, status=400)
+        roi, created = AnalysisROI.objects.update_or_create(
+            thread=thread,
+            defaults={'geometry': geometry_data}
+        )
+        message = "ROI created" if created else "ROI updated"
+        return Response({"message": f"{message} successfully"}, status=201 if created else 200)
+
+    def delete(self, request, *args, **kwargs):
+        thread_id = request.data.get('thread_id')
+        if not thread_id:
+            return Response({"error": "thread_id is required"}, status=400)
+        try:
+            AnalysisROI.objects.get(thread__id=thread_id).delete()
+            return Response({"message": "ROI deleted successfully"}, status=200)
+        except AnalysisROI.DoesNotExist:
+            return Response({"message": "No ROI found to delete"}, status=200)

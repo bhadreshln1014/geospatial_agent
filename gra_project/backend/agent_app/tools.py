@@ -7,6 +7,8 @@ import requests
 import shutil
 from pydantic import validate_call, FilePath, conlist, PositiveFloat, BaseModel
 from typing import List, Any, Dict
+
+from .models import AnalysisROI
 from .exceptions import ToolValidationError, ToolExecutionError
 import threading
 import re
@@ -15,6 +17,7 @@ from django.conf import settings
 import whitebox
 import rasterio
 import numpy as np
+import geopandas as gpd
 
 # Initialize WhiteboxTools at module level
 wbt = whitebox.WhiteboxTools()
@@ -491,3 +494,58 @@ def select_and_rasterize_vector(
         'rasterized_vector'
     )
     return rasterized_path
+
+def _get_roi_as_geoJSON(thread_id: str, output_dir: str) -> str:
+    try:
+        roi_instance = AnalysisROI.objects.get(thread__id=thread_id)
+        roi_geometry = roi_instance.geometry
+    except AnalysisROI.DoesNotExist:
+        raise ToolValidationError("No Region of Interest (ROI) has been set for this analysis. Please draw an ROI first.", "clip_data_to_roi")
+    except Exception as e:
+        raise ToolExecutionError(f"Failed to retrieve ROI from database: {e}", "clip_data_to_roi")
+    
+    try:
+        gdf = gpd.GeoDataFrame([{'geometry': roi_geometry}], crs="EPSG:4326")
+    except Exception as e:
+        raise ToolExecutionError(f"Failed to create GeoDataFrame from ROI geometry: {e}", "clip_data_to_roi")
+
+    output_path = os.path.join(output_dir, '_temp_roi_boundary.geojson')
+    try:
+        gdf.to_file(output_path, driver='GeoJSON')
+    except Exception as e:
+        raise ToolExecutionError(f"Failed to save temporary ROI file: {e}", "clip_data_to_roi")
+        
+    return output_path
+
+@register_tool
+@validate_call
+def clip_data_to_roi(data_to_clip_path: FilePath) -> FilePath:
+    """
+    Clips a dataset to the pre-defined Region of Interest (ROI) for this analysis.
+
+    When to Use:
+    - This should be one of the FIRST steps in any analysis, immediately after loading
+      a large-scale dataset (e.g., with `get_data_from_ps4` or `acquire_data_from_url`).
+    - It ensures that all subsequent processing is focused only on the user-defined
+      area, which is more efficient.
+    - It replaces the need to manually find and use a specific boundary file (like a district)
+      if the user has drawn their own area of interest.
+
+    Important Note:
+    - This tool will fail if an ROI has not been set for the current analysis thread.
+    - The tool automatically handles both raster and vector inputs.
+    """
+    thread_id, _, output_dir = get_workflow_context()
+    roi_boundary_path = _get_roi_as_geoJSON(thread_id, output_dir)
+    clipped_output_path = clip_data(
+        data_to_clip_path=data_to_clip_path,
+        clip_boundary_path=roi_boundary_path
+    )
+    
+    try:
+        if os.path.exists(roi_boundary_path):
+            os.remove(roi_boundary_path)
+    except Exception as e:
+        print(f"Warning: Could not remove temporary ROI file: {roi_boundary_path}. Error: {e}")
+
+    return clipped_output_path
